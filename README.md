@@ -13,8 +13,8 @@
 | 端到端驗證（`aws/scripts/50-verify.sh`） | **52 passed, 0 failed, 1 skipped**（詳見 [驗證報告](docs/verify-report.md)） |
 | 修正原專案既有缺陷 | 4 項（F1 跨租戶 by-id 存取、F2 缺少例外處理器導致 500、F3 gradle-wrapper.jar 未進版控、F5 `@EnableJpaRepositories` 讓 22 個 Controller 測試失敗），見 [§1.2](#12-評估時發現的問題已在本-repo-修正) |
 | 部署過程踩到並修正的問題 | 12 項，全部記錄在 [§10](#10-疑難排解實際踩到的坑) 與 [`docs/deployment-log.md`](docs/deployment-log.md) |
-| 截圖 | 25 張，位於 [`docs/images/`](docs/images/) |
-| 計費資源 | 驗證完成後**全部清除**（見 [§12](#12-清除所有計費資源)） |
+| 截圖 | 27 張，位於 [`docs/images/`](docs/images/) |
+| 計費資源 | 驗證完成後**全部清除並逐項確認為空**（2026-11-12 13:23 UTC，見 [§12.1](#121-本次實際清除結果2026-11-12)） |
 
 
 ---
@@ -707,7 +707,19 @@ aws logs describe-log-groups --log-group-name-prefix /rbac-poc --query 'logGroup
 
 > IAM User（`poc-admin`、`rbac-poc-deployer`）與帳號密碼政策**不計費**，由帳號擁有者決定是否保留。
 
-<!-- CLEANUP-RESULT -->
+### 12.1 本次實際清除結果（2026-11-12）
+
+| 階段 | 身分 | 時間 (UTC) | 結果 |
+|---|---|---|---|
+| `99-cleanup.sh` | rbac-poc-deployer | 13:02 – 13:12 | 60 → 10 共 6 個 stack 刪除完成 |
+| 殘留檢查 | rbac-poc-deployer | 13:13 | 剩 bootstrap stack、artifact bucket、兩個 **由 AWS 服務自行建立** 的 log group（`/aws/rds/instance/rbac-poc-postgres/postgresql`、`/aws/ecs/containerinsights/rbac-poc-cluster/performance`）—— 不屬於任何 stack，刪 stack 不會帶走 |
+| `99-cleanup.sh --all` | poc-admin | 13:21 – 13:22 | 清空 versioned bucket、刪除兩個 log group、刪除 IAM bootstrap |
+| 最終檢查 | poc-admin | 13:23 | stacks / NAT / EIP / VPC / RDS / RDS snapshots / ALB / ECS / ECR / Cognito / API Gateway / Lambda / CodeBuild / S3 / Secrets / Log groups / IAM roles **全部為空** |
+
+![deployer 階段殘留](docs/images/26-cleanup-deployer-residuals.jpg)
+![最終檢查全部為空](docs/images/27-cleanup-all-verified-empty.jpg)
+
+> 保留項目（不計費）：IAM User `poc-admin`、`rbac-poc-deployer`，以及帳號密碼政策。
 
 ---
 
