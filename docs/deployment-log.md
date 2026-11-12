@@ -23,3 +23,4 @@
 | 12:56 | deployer | `50-verify.sh` 第一次 | 11 pass / 42 fail：**驗證腳本本身的 bug**（`local m=... args=(... "$m")` 同一行宣告時 `$m` 尚未賦值 → curl `-X` 空白）；另 deployer 無 `ecr:DescribeImageScanFindings` | |
 | 12:58 | deployer | `50-verify.sh` 第二次 | 27 pass / 25 fail：所有 GET 由 ALB 回 400（`server: awselb/2.0`）。原因 ALB `desync_mitigation_mode=strictest` → 改 `defensive` 並 update stack | 21 |
 | 13:00 | deployer | ALB 改 defensive 後 `50-verify.sh` 第三次 | **52 passed, 0 failed, 1 skipped**（ECR scan 讀取權限） | 22, 23, 24, 25 |
+| 13:02–13:12 | deployer | `99-cleanup.sh`（60→10） | 全部刪除（約 10 分鐘）。殘留：bootstrap stack（IAM，免費）、artifact S3 bucket、兩個由 AWS 服務自行建立的 log group（RDS、Container Insights，0 bytes）→ 需 poc-admin 執行 `--all` | 26 |
