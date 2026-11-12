@@ -26,6 +26,7 @@
    - [2.1 AWS 服務詳解](#21-aws-服務詳解)（IAM、CloudFormation、CloudShell、VPC、Cognito、Lambda、API Gateway、ALB、ECS/Fargate、ECR、CodeBuild、S3、RDS、Secrets Manager、CloudWatch）
 3. [目標架構](#3-目標架構)
 4. [身分、群組、角色、權限的關聯與目的](#4-身分群組角色權限的關聯與目的)
+   - [4.0 帳號規劃與要求](#40-帳號規劃與要求)（帳號清單、為什麼要 MFA、強制機制、生命週期、收尾清單）
 5. [AWS 最佳實踐對照](#5-aws-最佳實踐對照)
 6. [程式碼改造說明](#6-程式碼改造說明)
 7. [基礎設施即程式碼（CloudFormation 00–60）](#7-基礎設施即程式碼cloudformation-0060)
@@ -634,12 +635,122 @@ flowchart LR
 | **A. AWS 管理平面** | 誰能「建置／部署／維運」AWS 資源 | AWS IAM | IAM Policy、Permissions Boundary、Service Role |
 | **B. 應用程式平面** | 誰能「呼叫業務 API」（商品、使用者、稽核） | Amazon Cognito | JWT（`cognito:groups`、`tenant_id`）→ Spring Security `@PreAuthorize` + TenantFilter |
 
+### 4.0 帳號規劃與要求
+
+本 POC 刻意把「人」分成三個身分，每個身分只在特定階段使用，用完就收起來。
+
+#### 4.0.1 帳號清單
+
+| 帳號 | 用途 | 權限 | 登入方式 | MFA | 使用階段 | POC 結束後 |
+|---|---|---|---|---|---|---|
+| **root** | 建立帳號、帳單，以及只有 root 能做的事 | 無法被任何政策限制 | email + 密碼 + MFA；**不留 access key** | **必須** | 只在 Step 0 用一次 | 鎖起來，平時不登入 |
+| **`poc-admin`** | 部署 IAM bootstrap（Step 1）、最終清除 `99-cleanup.sh --all` | `AdministratorAccess` + `rbac-poc-admin-force-mfa`（強制 MFA） | 主控台密碼 + MFA；**不發 access key** | **強制**（政策層級） | Step 1、最終清除（§12） | 停用主控台存取或刪除使用者 |
+| **`rbac-poc-deployer`** | 日常部署、建置、驗證、清除 workload | `RbacPocDeployers` 群組（`RbacPocDeployerPolicy` + `RbacPocForceMfaPolicy` + `ViewOnlyAccess` + `AWSCloudShellFullAccess`） | 主控台密碼 + MFA；**不發 access key** | **強制**（政策層級） | Step 2 – Step 7、清除 workload | bootstrap 刪除後已無任何權限，建議刪除使用者 |
+
+> 兩個 IAM User 都**只用主控台 + CloudShell**，沒有 access key。CloudShell 會自動帶入登入身分的短期憑證，因此整個 POC 沒有任何長期金鑰。
+
+#### 4.0.2 為什麼三個帳號都要 MFA
+
+| 理由 | 說明 |
+|---|---|
+| **密碼是唯一的長期憑證** | 沒有 access key，代表密碼一旦被釣魚、撞庫或重複使用而外洩，就能直接登入。MFA 讓「知道密碼」不等於「能登入」。 |
+| **CloudShell = 身分的全部權限** | CloudShell 自動取得登入身分的憑證。拿到 `poc-admin` 的主控台 session，就等於拿到 `AdministratorAccess` 的 shell。 |
+| **最小權限不能取代身分確認** | `rbac-poc-deployer` 雖然只能操作 `rbac-poc-*` stack，但仍能**刪除整個環境**、讀取 log、建立 Cognito 測試帳號。權限小不代表風險小。 |
+| **權限越大越需要** | `poc-admin` 權限最大，MFA 要求不能比 deployer 低（本版已修正為兩者皆強制，見 §4.0.4）。 |
+| **合規與稽核** | 金融等受監理產業普遍要求特權帳號使用多因子驗證；AWS Well-Architected 安全支柱亦建議所有人員身分使用 MFA。 |
+
+#### 4.0.3 MFA 是怎麼「強制」的
+
+只在 Console 上綁 MFA 裝置**不等於強制**：使用者仍可能用沒有 MFA 的方式取得 session（例如 access key）。本 POC 用 IAM 政策在授權層強制：
+
+```json
+{
+  "Sid": "DenyAllExceptMfaSetupIfNoMFA",
+  "Effect": "Deny",
+  "NotAction": ["iam:CreateVirtualMFADevice", "iam:EnableMFADevice", "iam:ListMFADevices",
+                "iam:ResyncMFADevice", "iam:ChangePassword", "iam:GetUser", "..."],
+  "Resource": "*",
+  "Condition": { "BoolIfExists": { "aws:MultiFactorAuthPresent": "false" } }
+}
+```
+
+| 重點 | 說明 |
+|---|---|
+| `aws:MultiFactorAuthPresent` | 以 MFA 登入的 session 會帶 `true`；沒有 MFA 的 session 為 `false` 或不存在 |
+| `BoolIfExists` | key 不存在（例如長期 access key 直接呼叫 API）也視為「沒有 MFA」而拒絕 |
+| 明確 `Deny` | 優先於任何 `Allow`，**連 `AdministratorAccess` 也蓋不過** |
+| `NotAction` 例外 | 沒有 MFA 時仍可設定自己的 MFA、改密碼，避免把自己完全鎖死 |
+
+| 政策 | 掛在 | 由誰建立 |
+|---|---|---|
+| `RbacPocForceMfaPolicy`（managed） | `RbacPocDeployers` 群組 → `rbac-poc-deployer` | `00-bootstrap-iam.yaml` |
+| `rbac-poc-admin-force-mfa`（inline） | `poc-admin` 使用者 | `00-bootstrap-iam.yaml`（參數 `AdminUserName`） |
+
+**防止部署途中把自己鎖死**
+- `00-bootstrap-iam.sh` 執行前會檢查呼叫者**已綁 MFA 裝置**，沒有就停止並提示先綁定、重新以 MFA 登入。
+- `rbac-poc-admin-force-mfa` 在 template 中 `DependsOn` 所有其他資源：**建立時最後才掛上、刪除時最先移除**。
+
+#### 4.0.4 文件與設定一致性修正
+
+| 項目 | 實際部署時（2026-11-12） | 本版 |
+|---|---|---|
+| `poc-admin` MFA | 由人手動綁定，**沒有政策強制**；文件寫「建議」 | 由 `rbac-poc-admin-force-mfa` **強制**，文件改為「必須」 |
+| `00-bootstrap-iam.sh` | 只檢查不是 root | 另檢查呼叫者已綁 MFA |
+
+> ⚠️ 這項強化是**在 AWS 驗證與清除完成之後**才加入的，目前只通過 `cfn-lint` 與 shell 語法檢查，**尚未在 AWS 上重新部署驗證**。下次依本教學部署時，請確認 Step 1 輸出的 `AdminMfaEnforcedFor` 為 `poc-admin`，並以 `aws iam list-user-policies --user-name poc-admin` 檢查已掛上 `rbac-poc-admin-force-mfa`。
+
+#### 4.0.5 帳號生命週期
+
+```mermaid
+flowchart LR
+    subgraph S0["Step 0（root）"]
+        A1[root 綁 MFA<br/>刪除 root access key] --> A2[建立 poc-admin<br/>rbac-poc-deployer<br/>（不發 access key）]
+        A2 --> A3[poc-admin 掛 AdministratorAccess<br/>設定密碼政策]
+        A3 --> A4[兩個帳號綁 MFA]
+    end
+    subgraph S1["Step 1（poc-admin + MFA）"]
+        B1[00-bootstrap-iam.sh<br/>檢查 MFA] --> B2[建立 CFN 執行角色 / Boundary<br/>deployer 群組 / bucket]
+        B2 --> B3[最後掛上 admin 強制 MFA]
+    end
+    subgraph S2["Step 2–7（deployer + MFA）"]
+        C1[部署 / 建置 / 驗證] --> C2[99-cleanup.sh]
+    end
+    subgraph S3["收尾（poc-admin + MFA）"]
+        D1[99-cleanup.sh --all<br/>刪除 bootstrap] --> D2[deployer 失去所有權限]
+        D2 --> D3[停用或刪除<br/>兩個 IAM User]
+    end
+    S0 --> S1 --> S2 --> S3
+```
+
+#### 4.0.6 收尾檢查清單
+
+```bash
+# 1) 兩個 IAM User 的狀態（政策、群組、MFA、access key）
+for u in poc-admin rbac-poc-deployer; do
+  printf '%-18s policies=[%s] inline=[%s] groups=[%s] mfa=[%s] keys=[%s]\n' $u \
+    "$(aws iam list-attached-user-policies --user-name $u --query 'AttachedPolicies[].PolicyName' --output text)" \
+    "$(aws iam list-user-policies --user-name $u --query 'PolicyNames' --output text)" \
+    "$(aws iam list-groups-for-user --user-name $u --query 'Groups[].GroupName' --output text)" \
+    "$(aws iam list-mfa-devices --user-name $u --query 'length(MFADevices)' --output text)" \
+    "$(aws iam list-access-keys --user-name $u --query 'length(AccessKeyMetadata)' --output text)"
+done
+# 2) root：MFA=1、AccessKeys=0
+aws iam get-account-summary --query 'SummaryMap.[AccountMFAEnabled,AccountAccessKeysPresent]' --output text
+```
+
+| 檢查 | 期望 |
+|---|---|
+| root | `MFA=1`、`AccessKeys=0` |
+| `rbac-poc-deployer` | 不再使用就刪除（IAM → 使用者 → 刪除）；保留則確認已無群組 |
+| `poc-admin` | 不再使用就停用主控台存取或刪除；保留則確認 MFA 已綁定 |
+| `rbac-poc-deployer` 的 CloudShell | 刪除 `~/.rbac-poc/`（含測試帳號密碼檔），或「動作 → 刪除」整個環境 |
+
 ### 4.1 AWS 管理平面（IAM）
 
 ```mermaid
 flowchart TB
     ROOT["👤 root<br/>只用於帳號層級任務<br/>MFA ✔ / 不留 access key"]
-    ADMIN["👤 IAM User: poc-admin<br/>Policy: AdministratorAccess<br/>(建議 MFA)"]
+    ADMIN["👤 IAM User: poc-admin<br/>Policy: AdministratorAccess<br/>+ rbac-poc-admin-force-mfa<br/>(MFA 必須)"]
     DEP["👤 IAM User: rbac-poc-deployer<br/>(MFA 必須)"]
     GRP["👥 IAM Group: RbacPocDeployers"]
     P1["📜 RbacPocDeployerPolicy<br/>只能操作 rbac-poc-* stack<br/>只能 PassRole 給 CFN 執行角色<br/>上傳 artifact / 啟動 CodeBuild<br/>在 Project=rbac-poc 的 User Pool 建測試帳號<br/>鎖 us-east-1"]
@@ -668,11 +779,12 @@ flowchart TB
 | 身分 / 物件 | 類型 | 目的 | 為什麼這樣設計（最佳實踐） |
 |---|---|---|---|
 | root | 帳號根使用者 | 只做「必須用 root」的事 | AWS 建議 root 不做日常操作；開 MFA、刪除 access key |
-| `poc-admin` | IAM User + `AdministratorAccess` | 一次性部署 IAM bootstrap（建角色、政策、群組） | 讓建立 IAM 這種高權限動作與日常部署分離 |
+| `poc-admin` | IAM User + `AdministratorAccess` + `rbac-poc-admin-force-mfa` | 一次性部署 IAM bootstrap（建角色、政策、群組）、最終清除 | 讓建立 IAM 這種高權限動作與日常部署分離；權限最大，所以 **MFA 由政策強制**（§4.0.3） |
 | `rbac-poc-deployer` | IAM User（無 access key，只用 Console + CloudShell） | 日常部署、驗證、清除 | **最小權限**：本身不能直接建 VPC/RDS/ECS，只能透過 CloudFormation 執行角色 |
 | `RbacPocDeployers` | IAM Group | 權限掛在群組而非個人 | 人員異動只要調整群組成員 |
 | `RbacPocDeployerPolicy` | Customer managed policy | 限制 stack 名稱、PassRole 對象、Region、Cognito pool tag；可讀取本專案 ECR 掃描結果與 CodeBuild 測試報表 | 避免部署者動到其他專案資源；讀取權限也限定在 `rbac-poc*` 資源 |
-| `RbacPocForceMfaPolicy` | Customer managed policy | 沒有 MFA 時拒絕所有動作 | 強制 MFA |
+| `RbacPocForceMfaPolicy` | Customer managed policy（掛在 deployer 群組） | 沒有 MFA 時拒絕所有動作 | 強制 MFA（§4.0.3） |
+| `rbac-poc-admin-force-mfa` | Inline policy（掛在 `poc-admin`） | 同上，對象是管理者 | 權限最大的帳號也必須強制 MFA；明確 Deny 蓋過 `AdministratorAccess` |
 | `RbacPocCfnExecutionRole` | Service role（CloudFormation） | 實際建立所有資源 | **職責分離**：人只有「交給 CFN」的權限；所有變更都有 stack 紀錄可追蹤、可回滾 |
 | `rbac-poc-workload-boundary` | Permissions Boundary | 所有 workload 角色的權限上限 | 防止「透過建立高權限角色提權」：CFN 執行角色若建立不掛 Boundary 的角色會被 IAM 拒絕 |
 | ECS execution role | Service role | ECS agent 拉 image、寫 log、取 DB secret | 與 task role 分離 |
@@ -758,7 +870,7 @@ flowchart LR
 | 面向 | 最佳實踐 | 本 POC 做法 | 對應檔案 |
 |---|---|---|---|
 | 身分 | 不使用 root 做日常操作、root 開 MFA、不留 root access key | root 只用來建立 `poc-admin` 與密碼政策；建議刪除 root access key | §8 Step 0 |
-| 身分 | 人員使用最小權限、強制 MFA | `rbac-poc-deployer` 只拿到 `RbacPocDeployerPolicy` + `RbacPocForceMfaPolicy` | `00-bootstrap-iam.yaml` |
+| 身分 | 人員使用最小權限、強制 MFA | `rbac-poc-deployer` 只拿到 `RbacPocDeployerPolicy` + `RbacPocForceMfaPolicy`；`poc-admin` 由 `rbac-poc-admin-force-mfa` 強制 MFA（§4.0） | `00-bootstrap-iam.yaml` |
 | 身分 | 職責分離、可稽核的變更 | 所有資源只透過 `RbacPocCfnExecutionRole` 由 CloudFormation 建立 | `env.sh::cfn_deploy` |
 | 身分 | 防止透過建立角色提權 | Permissions Boundary + `iam:PermissionsBoundary` 條件 | `00-bootstrap-iam.yaml` |
 | 身分 | 不使用長期金鑰 | 部署者沒有 access key（只用 Console + CloudShell）；workload 全部用 IAM Role | |
@@ -846,7 +958,7 @@ spring:
 
 | Stack | 檔案 | 部署者 | 主要資源 | 時間 |
 |---|---|---|---|---|
-| `rbac-poc-00-bootstrap-iam` | `00-bootstrap-iam.yaml` | **poc-admin**（一次性） | CFN 執行角色、Boundary、部署者群組 / 政策、artifact bucket | ~1 分 |
+| `rbac-poc-00-bootstrap-iam` | `00-bootstrap-iam.yaml` | **poc-admin**（一次性） | CFN 執行角色、Boundary、部署者群組 / 政策、artifact bucket、`poc-admin` 強制 MFA | ~1 分 |
 | `rbac-poc-10-network` | `10-network.yaml` | deployer | VPC、6 子網路、NAT、S3 endpoint、4 個 SG、Flow Logs | ~3 分 |
 | `rbac-poc-20-data` | `20-data.yaml` | deployer | RDS PostgreSQL 16、參數群組（force_ssl） | ~10 分 |
 | `rbac-poc-30-identity` | `30-identity.yaml` | deployer | User Pool、5 Groups、2 App Clients、Hosted UI domain、Pre-token Lambda | ~1 分 |
@@ -861,7 +973,7 @@ Stack 之間以 **CloudFormation Exports / ImportValue** 串接（例如 `rbac-p
 | 腳本 | 執行身分 | 作用 |
 |---|---|---|
 | `aws/scripts/env.sh` | — | 共用設定；`cfn_deploy` 一律帶 `--role-arn RbacPocCfnExecutionRole` |
-| `00-bootstrap-iam.sh` | poc-admin | 部署 IAM bootstrap；偵測到 deployer user 已存在時只加入群組；拒絕 root 執行 |
+| `00-bootstrap-iam.sh` | poc-admin | 部署 IAM bootstrap；拒絕 root 執行；**呼叫者未綁 MFA 就停止**；偵測到 deployer user 已存在時只加入群組；對呼叫者掛上強制 MFA |
 | `01-preflight.sh` | deployer | 身分、region、bootstrap 輸出、template 驗證 |
 | `10-deploy-foundation.sh` | deployer | network → (data ∥ identity → build) |
 | `20-build-images.sh` | deployer | 打包原始碼 → S3 → CodeBuild（單元測試 + image）→ 取得 image tag |
@@ -920,7 +1032,10 @@ Stack 之間以 **CloudFormation Exports / ImportValue** 串接（例如 `rbac-p
    ![授權與密碼政策](docs/images/02-root-attach-admin-and-password-policy.jpg)
    ![檢查後](docs/images/03-iam-users-check-after.jpg)
 
-5. 替 `poc-admin`、`rbac-poc-deployer` 指派 MFA 裝置（IAM → 使用者 → 安全憑證 → 指派 MFA）。
+5. **替 `poc-admin`、`rbac-poc-deployer` 指派 MFA 裝置**（IAM → 使用者 → 安全憑證 → 指派 MFA）。**這一步不能省**：
+   - Step 1 的 bootstrap 會對 `poc-admin` 與 deployer 群組掛上「沒有 MFA 就拒絕一切」的政策，沒綁 MFA 的帳號登入後只能設定 MFA。
+   - `00-bootstrap-iam.sh` 會先檢查呼叫者已綁 MFA，沒有就停止。
+   - 原因與機制見 [§4.0](#40-帳號規劃與要求)。
 6. 若 root 有 access key：先「停用」，確認沒有程式依賴後再「刪除」：
 
    ```bash
@@ -930,7 +1045,7 @@ Stack 之間以 **CloudFormation Exports / ImportValue** 串接（例如 `rbac-p
    aws iam delete-access-key --access-key-id $K      # 不可復原
    ```
 
-7. 登出 root，使用 `https://<帳號ID>.signin.aws.amazon.com/console` 以 `poc-admin` 登入。
+7. 登出 root，使用 `https://<帳號ID>.signin.aws.amazon.com/console` 以 `poc-admin` **搭配 MFA** 登入。
 
 ### Step 1：IAM Bootstrap（poc-admin）
 
@@ -948,7 +1063,7 @@ Stack 之間以 **CloudFormation Exports / ImportValue** 串接（例如 `rbac-p
    ./aws/scripts/00-bootstrap-iam.sh
    ```
 
-   腳本會：拒絕 root 執行 → 偵測 `rbac-poc-deployer` 是否已存在（已存在則只加入群組）→ 部署 `rbac-poc-00-bootstrap-iam`。
+   腳本會：拒絕 root 執行 → **檢查呼叫者已綁 MFA** → 偵測 `rbac-poc-deployer` 是否已存在（已存在則只加入群組）→ 部署 `rbac-poc-00-bootstrap-iam`（最後一步對 `poc-admin` 掛上 `rbac-poc-admin-force-mfa`）。
 
    ![bootstrap 成功](docs/images/09-bootstrap-success.jpg)
 
@@ -1131,7 +1246,7 @@ aws ecr describe-repositories --query "repositories[?starts_with(repositoryName,
 aws logs describe-log-groups --log-group-name-prefix /rbac-poc --query 'logGroups[].logGroupName' --output text
 ```
 
-> IAM User（`poc-admin`、`rbac-poc-deployer`）與帳號密碼政策**不計費**，由帳號擁有者決定是否保留。
+> IAM User（`poc-admin`、`rbac-poc-deployer`）與帳號密碼政策**不計費**，由帳號擁有者決定是否保留。`--all` 刪除 bootstrap 後，deployer 已無任何權限、`poc-admin` 的強制 MFA 政策也會一併移除；帳號收尾請依 [§4.0.6](#406-收尾檢查清單)。
 
 ### 12.1 本次實際清除結果（2026-11-12）
 

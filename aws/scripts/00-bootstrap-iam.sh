@@ -10,6 +10,14 @@ ARN="$(aws sts get-caller-identity --query Arn --output text)"
 [[ "$ARN" == *":root" ]] && die "You are signed in as ROOT. Sign in as an IAM administrator (e.g. rex-admin) instead."
 log "Caller: $ARN"
 
+# The stack attaches a force-MFA deny policy to the administrator (and the deployer group).
+# Refuse to run unless the caller already has an MFA device, otherwise the next
+# sign-in without MFA could only set up MFA and nothing else.
+ADMIN_USER="${ADMIN_USER:-${ARN##*/}}"
+MFA_COUNT="$(aws iam list-mfa-devices --query 'length(MFADevices)' --output text)"
+[[ "$MFA_COUNT" -ge 1 ]] || die "No MFA device on ${ADMIN_USER}. Assign MFA, sign out and sign in again WITH MFA, then rerun."
+ok "MFA device present on ${ADMIN_USER} (${MFA_COUNT})"
+
 DEPLOYER_USER="${DEPLOYER_USER:-rbac-poc-deployer}"
 # If the deployer user was created by hand in the console, only add it to the group
 if aws iam get-user --user-name "$DEPLOYER_USER" >/dev/null 2>&1 \
@@ -24,7 +32,7 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM \
   --no-fail-on-empty-changeset \
   --tags Project="$PROJECT" ManagedBy=CloudFormation \
-  --parameter-overrides ProjectName="$PROJECT" DeployerUserName="$DEPLOYER_USER" DeployerUserExists="$USER_EXISTS" AllowedRegion="$AWS_REGION"
+  --parameter-overrides ProjectName="$PROJECT" DeployerUserName="$DEPLOYER_USER" DeployerUserExists="$USER_EXISTS" AdminUserName="$ADMIN_USER" AllowedRegion="$AWS_REGION"
 
 aws cloudformation describe-stacks --stack-name "$STACK_BOOTSTRAP" \
   --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table

@@ -5,7 +5,8 @@ Description: >
   execution role used for ALL later stacks, (3) deployer IAM group with
   least-privilege policy + MFA enforcement, (4) optional deployer IAM user
   (no password / no access key - the human sets console password + MFA),
-  (5) S3 artifact bucket for CodeBuild source.
+  (5) S3 artifact bucket for CodeBuild source, (6) MFA enforcement for the
+  existing administrator user (poc-admin).
 
 Parameters:
   ProjectName:
@@ -26,8 +27,15 @@ Parameters:
   AllowedRegion:
     Type: String
     Default: us-east-1
+  AdminUserName:
+    Type: String
+    Default: poc-admin
+    Description: >
+      Existing IAM administrator user (created by root in Step 0) that must also be forced to use MFA.
+      Leave empty to skip (e.g. when administrators come from IAM Identity Center).
 
 Conditions:
+  EnforceAdminMfa: !Not [!Equals [!Ref AdminUserName, '']]
   CreateUser: !Equals [!Ref DeployerUserExists, 'false']
   AttachExistingUser: !Equals [!Ref DeployerUserExists, 'true']
 
@@ -365,6 +373,47 @@ Resources:
       GroupName: !Ref DeployerGroup
       Users: [!Ref DeployerUserName]
 
+  # ------------------------------------------------------------------
+  # 5. Force MFA for the administrator user as well.
+  #    poc-admin holds AdministratorAccess, so it needs MFA at least as much
+  #    as the deployer. Explicit Deny overrides the Allow in AdministratorAccess.
+  #    DependsOn everything else so it is attached LAST on create and removed
+  #    FIRST on delete - a session without MFA cannot lock itself out mid-stack.
+  # ------------------------------------------------------------------
+  AdminForceMfa:
+    Type: AWS::IAM::Policy
+    Condition: EnforceAdminMfa
+    DependsOn:
+      - WorkloadBoundary
+      - CfnExecutionRole
+      - ArtifactBucket
+      - ArtifactBucketPolicy
+      - DeployerPolicy
+      - ForceMfaPolicy
+      - DeployerGroup
+    Properties:
+      PolicyName: rbac-poc-admin-force-mfa
+      Users: [!Ref AdminUserName]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyAllExceptMfaSetupIfNoMFA
+            Effect: Deny
+            NotAction:
+              - iam:CreateVirtualMFADevice
+              - iam:EnableMFADevice
+              - iam:GetUser
+              - iam:ListMFADevices
+              - iam:ListVirtualMFADevices
+              - iam:ResyncMFADevice
+              - iam:ChangePassword
+              - iam:GetAccountPasswordPolicy
+              - iam:GetLoginProfile
+              - sts:GetSessionToken
+            Resource: '*'
+            Condition:
+              BoolIfExists: { 'aws:MultiFactorAuthPresent': 'false' }
+
 Outputs:
   CfnExecutionRoleArn:
     Value: !GetAtt CfnExecutionRole.Arn
@@ -377,5 +426,7 @@ Outputs:
     Export: { Name: !Sub '${ProjectName}-artifact-bucket' }
   DeployerGroupName:
     Value: !Ref DeployerGroup
+  AdminMfaEnforcedFor:
+    Value: !If [EnforceAdminMfa, !Ref AdminUserName, 'none']
   ConsoleSignInUrl:
     Value: !Sub 'https://${AWS::AccountId}.signin.aws.amazon.com/console'
