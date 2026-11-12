@@ -29,9 +29,7 @@ TAG="$(aws codebuild batch-get-builds --ids "$BUILD_ID" \
         --query "builds[0].exportedEnvironmentVariables[?name=='IMAGE_TAG'].value" --output text)"
 echo "$TAG" > "$STATE_DIR/image-tag"
 ok "images pushed with tag $TAG (saved to $STATE_DIR/image-tag)"
-aws codebuild batch-get-builds --ids "$BUILD_ID" --query 'builds[0].reportArns' --output text \
- | tr '\t' '\n' | while read -r R; do
-   [[ -z "$R" ]] && continue
-   aws codebuild describe-test-cases --report-arn "$R" --query 'testCases[].status' --output text \
-     | tr '\t' '\n' | sort | uniq -c | sed 's/^/  unit tests: /'
- done
+# Unit-test summary is printed by buildspec into the build log (deployer has no codebuild report read rights)
+aws logs filter-log-events --log-group-name "/aws/codebuild/${PROJECT}-build" \
+  --log-stream-names "${BUILD_ID#*:}" --filter-pattern '"TEST SUMMARY"' \
+  --query 'events[0].message' --output text 2>/dev/null | sed 's/^/  /'

@@ -30,6 +30,14 @@ phases:
           grep -h -B1 -A12 "<failure" libs/*/build/test-results/test/*.xml services/*/build/test-results/test/*.xml 2>/dev/null | head -200
           exit 1
         }
+      - |
+        python3 - <<'PY'
+        import glob, xml.etree.ElementTree as ET
+        t=f=e=s=0
+        for x in glob.glob('libs/*/build/test-results/test/*.xml')+glob.glob('services/*/build/test-results/test/*.xml'):
+            r=ET.parse(x).getroot(); t+=int(r.get('tests',0)); f+=int(r.get('failures',0)); e+=int(r.get('errors',0)); s+=int(r.get('skipped',0))
+        print(f"TEST SUMMARY: tests={t} failures={f} errors={e} skipped={s}")
+        PY
       - echo "=== Build Spring Boot jars ==="
       - ./gradlew :services:product-service:bootJar :services:user-service:bootJar -x test
       - echo "=== Docker build ==="

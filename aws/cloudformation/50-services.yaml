@@ -111,7 +111,27 @@ Resources:
       TaskRoleArn: !GetAtt TaskRole.Arn
       Volumes: [{ Name: tmp }]
       ContainerDefinitions:
+        # Fargate creates the ephemeral 'tmp' volume as root:root 0755, so the non-root app
+        # (UID 65532) could not write Tomcat's work dir. This init container runs once as root,
+        # opens /tmp (1777) and exits; the app container starts only after it succeeds.
+        - Name: init-tmp
+          Image: !Sub
+            - '${Repo}:${ImageTag}'
+            - Repo: !ImportValue { 'Fn::Sub': '${ProjectName}-product-repo-uri' }
+          Essential: false
+          User: '0'
+          ReadonlyRootFilesystem: true
+          EntryPoint: [sh, -c]
+          Command: ['chmod 1777 /tmp && echo tmp-ready']
+          MountPoints: [{ SourceVolume: tmp, ContainerPath: /tmp }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProductLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: init
         - Name: product-service
+          DependsOn: [{ ContainerName: init-tmp, Condition: SUCCESS }]
           Image: !Sub
             - '${Repo}:${ImageTag}'
             - Repo: !ImportValue { 'Fn::Sub': '${ProjectName}-product-repo-uri' }
@@ -221,7 +241,27 @@ Resources:
       TaskRoleArn: !GetAtt TaskRole.Arn
       Volumes: [{ Name: tmp }]
       ContainerDefinitions:
+        # Fargate creates the ephemeral 'tmp' volume as root:root 0755, so the non-root app
+        # (UID 65532) could not write Tomcat's work dir. This init container runs once as root,
+        # opens /tmp (1777) and exits; the app container starts only after it succeeds.
+        - Name: init-tmp
+          Image: !Sub
+            - '${Repo}:${ImageTag}'
+            - Repo: !ImportValue { 'Fn::Sub': '${ProjectName}-user-repo-uri' }
+          Essential: false
+          User: '0'
+          ReadonlyRootFilesystem: true
+          EntryPoint: [sh, -c]
+          Command: ['chmod 1777 /tmp && echo tmp-ready']
+          MountPoints: [{ SourceVolume: tmp, ContainerPath: /tmp }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref UserLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: init
         - Name: user-service
+          DependsOn: [{ ContainerName: init-tmp, Condition: SUCCESS }]
           Image: !Sub
             - '${Repo}:${ImageTag}'
             - Repo: !ImportValue { 'Fn::Sub': '${ProjectName}-user-repo-uri' }

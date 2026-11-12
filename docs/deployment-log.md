@@ -14,3 +14,4 @@
 | 11:39 | deployer | 刪除 ROLLBACK_COMPLETE 的 identity stack、修正後重部署 identity / build | 成功（identity 約 1.5 分、build 約 1 分）；data (RDS) 仍在建立 | 14 |
 | 11:42 | deployer | `20-build-images.sh`：zip 原始碼 (780 KB) → S3 → CodeBuild | 啟動 | |
 | 11:44 | deployer | CodeBuild #1 | **失敗**：security-lib / user-service 測試通過；product-service 128 測試中 22 個失敗（全部 `@WebMvcTest` Controller 測試，`NoSuchBeanDefinitionException`）。查 git 歷史：`@EnableJpaRepositories` 於 e2ac84b 加到 `ProductServiceApplication`，晚於 Controller 測試，**原專案既有回歸**。修正：移到 `config/JpaConfig`。另：deployer 無 `codebuild:ListReportsForReportGroup` 權限（最小權限生效），改在 buildspec 失敗時直接印出失敗測試細節 | 15 |
+| 11:52 | deployer | `30-deploy-services.sh` | ECS task 啟動失敗：`Unable to create tempDir. java.io.tmpdir is set to /tmp` / `AccessDeniedException`。原因：Fargate 的 ephemeral bind volume 預設為 root:root 0755，非 root 容器（UID 65532）無法寫入。修正：加入 init container（root、執行 `chmod 1777 /tmp` 後結束），app 容器 `DependsOn: SUCCESS`；仍維持非 root + 唯讀 root FS | 16 |
