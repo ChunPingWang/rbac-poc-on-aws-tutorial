@@ -23,6 +23,7 @@
 
 1. [專案評估：原架構盤點與發現](#1-專案評估原架構盤點與發現)
 2. [開源元件 → AWS 服務對照與選型理由](#2-開源元件--aws-服務對照與選型理由)
+   - [2.1 AWS 服務詳解](#21-aws-服務詳解)（IAM、CloudFormation、CloudShell、VPC、Cognito、Lambda、API Gateway、ALB、ECS/Fargate、ECR、CodeBuild、S3、RDS、Secrets Manager、CloudWatch）
 3. [目標架構](#3-目標架構)
 4. [身分、群組、角色、權限的關聯與目的](#4-身分群組角色權限的關聯與目的)
 5. [AWS 最佳實踐對照](#5-aws-最佳實踐對照)
@@ -83,6 +84,430 @@
 | docker logs / kubectl logs | **Amazon CloudWatch Logs**、Container Insights、VPC Flow Logs | |
 | cert-manager mTLS（東西向） | **未部署**（見 [§13](#13-走向-production-的強化建議)） | AWS Private CA 一般模式每月約 US$400；POC 以 Security Group 鏈 + 私有子網路取代，正式環境可用 VPC Lattice / Service Connect TLS |
 | Spring Cloud Gateway 的 CORS | API Gateway `CorsConfiguration` | |
+
+### 2.1 AWS 服務詳解
+
+本節逐一說明本 POC 用到的 AWS 服務：**它是什麼、核心概念、本 POC 怎麼用、Console 在哪裡、怎麼計費、要注意什麼**。
+服務依「一次部署」的先後順序排列：先有身分與部署工具，再有網路、資料、身分驗證、建置，最後是運算與 API 入口。
+
+> 💲 計費數字取自 2026-11 的 AWS 官方定價頁（連結見 [§2.1.17](#2117-參考資料)），以 **us-east-1** 為準。官方表格沒有直接顯示、只能從範例推算或無法確認的數字，會標註 **（推算）** 或 **（未確認）**，請以 [AWS Pricing Calculator](https://calculator.aws/) 為準。
+
+#### 服務關係總覽
+
+```mermaid
+flowchart LR
+    subgraph Mgmt["管理與部署"]
+        IAM[IAM] --> CFN[CloudFormation]
+        SHELL[CloudShell] --> CFN
+    end
+    subgraph Build["建置"]
+        S3[S3] --> CB[CodeBuild] --> ECR[ECR]
+    end
+    subgraph Identity["身分驗證"]
+        COG[Cognito] --> LMB[Lambda]
+    end
+    subgraph Runtime["執行期"]
+        APIGW[API Gateway] --> ALB[ALB] --> ECS[ECS on Fargate] --> RDS[RDS PostgreSQL]
+        SM[Secrets Manager] -.-> ECS
+    end
+    subgraph Net["網路"]
+        VPC[VPC / NAT / SG]
+    end
+    subgraph Obs["觀測"]
+        CW[CloudWatch]
+    end
+    CFN --> Net & Build & Identity & Runtime
+    ECR -.-> ECS
+    COG -.JWT.-> APIGW
+    Runtime -.logs.-> CW
+```
+
+| 類別 | 服務 | 一句話 | 取代原專案的 |
+|---|---|---|---|
+| 身分與治理 | IAM | 控制「誰能對哪個 AWS 資源做什麼」 | （無，原本在本機跑） |
+| 部署 | CloudFormation | AWS 原生 IaC，用 YAML 宣告資源 | `k8s-deploy.sh`、K8s manifests |
+| 操作環境 | CloudShell | 瀏覽器裡、已帶身分的 Linux shell | 本機終端機 |
+| 網路 | VPC（含 Subnet、NAT、Endpoint、SG、Flow Logs） | 你的私有網路 | Docker network / K8s cluster network |
+| 使用者身分 | Cognito | 託管的使用者目錄 + OAuth2/OIDC IdP | Keycloak + OpenLDAP |
+| 函式運算 | Lambda | 事件觸發的無伺服器函式 | Keycloak protocol mapper |
+| API 入口 | API Gateway（HTTP API） | 託管 API 閘道，驗 JWT、節流、記錄 | Spring Cloud Gateway |
+| 負載平衡 | Elastic Load Balancing（ALB） | 第 7 層負載平衡與路徑路由 | K8s Service / NodePort |
+| 容器運算 | ECS + Fargate | 不用管主機的容器執行平台 | Kind / K8s Deployment |
+| 映像倉庫 | ECR | 私有容器映像倉庫 | 本機 Docker image |
+| 建置 | CodeBuild | 託管建置環境（測試、打包、建 image） | 本機 `./gradlew` + `docker build` |
+| 物件儲存 | S3 | 物件儲存 | （無） |
+| 資料庫 | RDS for PostgreSQL | 託管關聯式資料庫 | PostgreSQL / H2 容器 |
+| 祕密管理 | Secrets Manager | 存放並輪換密碼 | K8s Secret（明碼 base64） |
+| 觀測 | CloudWatch（Logs、Container Insights） | 日誌與指標 | `docker logs` / `kubectl logs` |
+
+---
+
+#### 2.1.1 AWS IAM（Identity and Access Management）
+
+**是什麼**：AWS 的權限系統。每一個 API 呼叫（包含你在 Console 上按的每個按鈕）都會由 IAM 判斷「這個身分可不可以對這個資源做這件事」。IAM 本身**不收費**。
+
+**核心概念**
+
+| 概念 | 說明 | 本 POC 例子 |
+|---|---|---|
+| Root user | 建立帳號的 email 身分，權限無法被限制 | 只用來建立 `poc-admin` |
+| IAM User | 長期存在的人員身分（密碼 + MFA，或 access key） | `poc-admin`、`rbac-poc-deployer` |
+| IAM Group | User 的集合，政策掛在群組上 | `RbacPocDeployers` |
+| IAM Role | 沒有長期密碼、由別人「扮演」（AssumeRole）取得暫時憑證的身分 | `RbacPocCfnExecutionRole`、ECS / CodeBuild / Lambda 的角色 |
+| Trust policy | 角色上的「誰可以扮演我」 | `cloudformation.amazonaws.com` 才能扮演 CFN 執行角色 |
+| Identity policy | 「這個身分可以做什麼」（Allow / Deny、Action、Resource、Condition） | `RbacPocDeployerPolicy` |
+| Permissions Boundary | 權限上限：實際權限 = identity policy ∩ boundary | `rbac-poc-workload-boundary` |
+| `iam:PassRole` | 把角色「交給」某個 AWS 服務使用的權限 | deployer 只能把 CFN 執行角色交給 CloudFormation |
+| AWS managed / Customer managed policy | AWS 維護的政策 vs 自己寫的政策 | `ViewOnlyAccess`（AWS）、`RbacPocDeployerPolicy`（自訂） |
+
+**評估邏輯（簡化）**：明確 Deny > 明確 Allow > 預設拒絕；有 Boundary 時，Allow 必須同時出現在 identity policy 與 boundary 內。
+
+**本 POC 怎麼用**：`00-bootstrap-iam.yaml`，關係圖見 [§4.1](#41-aws-管理平面iam)。
+
+**Console**：IAM → 使用者 / 使用者群組 / 角色 / 政策。
+
+**注意事項**
+- 本次驗證中多次遇到 `AccessDeniedException`（讀 CodeBuild 報表、ECR 掃描結果），這正是最小權限生效的表現。正確作法是**評估後只補必要的唯讀權限**（已補在 template），而不是改掛 `AdministratorAccess`。
+- Production 建議改用 **IAM Identity Center**（SSO + 短期憑證），而不是 IAM User。
+
+---
+
+#### 2.1.2 AWS CloudFormation — AWS 原生的 IaC
+
+**是什麼**：**AWS 原生的 Infrastructure as Code（IaC）服務**。你用 YAML / JSON **宣告**想要的資源（「要一個 VPC、兩個子網路、一個 RDS」），CloudFormation 負責依相依順序建立、更新、刪除，失敗時自動回滾。CloudFormation 本身管理 AWS 原生資源**不另收費**，只付它建出來的資源費用。
+
+**和其他 IaC 工具的關係**
+
+| 工具 | 類型 | 與 CloudFormation 的關係 |
+|---|---|---|
+| CloudFormation | 宣告式 YAML / JSON，AWS 託管狀態 | — |
+| AWS CDK | 用 TypeScript / Python / Java 寫程式 | **編譯成 CloudFormation template** 再部署 |
+| AWS SAM | 無伺服器專用簡寫 | 也是轉成 CloudFormation |
+| Terraform / OpenTofu | 宣告式 HCL，自管 state 檔 | 不經過 CloudFormation，直接呼叫 AWS API；可跨雲 |
+
+**核心概念**
+
+| 概念 | 說明 | 本 POC 例子 |
+|---|---|---|
+| Template | 資源宣告檔：`Parameters`、`Conditions`、`Resources`、`Outputs` | `aws/cloudformation/*.yaml` |
+| Stack | 依 template 建出來的一組資源，一起建立、更新、刪除 | `rbac-poc-10-network` … |
+| Change set | 部署前的變更預覽（新增 / 修改 / 取代哪些資源） | `aws cloudformation deploy` 內部會先建 change set |
+| Export / `Fn::ImportValue` | 跨 stack 傳值 | `rbac-poc-issuer-uri`、`rbac-poc-db-secret-arn` |
+| Service role（`--role-arn`） | CloudFormation 用這個角色去建資源，而不是用操作者的權限 | `RbacPocCfnExecutionRole` |
+| Rollback | 建立或更新失敗時自動還原 | identity、services stack 失敗時都自動回滾 |
+| `DeletionPolicy` | 刪除 stack 時資源要刪除、保留還是留 snapshot | RDS 設 `Delete`（POC）；production 建議 `Snapshot` |
+| Drift detection | 偵測有人在 Console 手動改了資源 | 本 POC 未使用 |
+
+**狀態機（本次實際遇到的）**
+
+```mermaid
+stateDiagram-v2
+    [*] --> CREATE_IN_PROGRESS
+    CREATE_IN_PROGRESS --> CREATE_COMPLETE : 成功
+    CREATE_IN_PROGRESS --> ROLLBACK_IN_PROGRESS : 任一資源失敗
+    ROLLBACK_IN_PROGRESS --> ROLLBACK_COMPLETE
+    ROLLBACK_COMPLETE --> DELETE_IN_PROGRESS : 只能刪除後重建
+    CREATE_COMPLETE --> UPDATE_IN_PROGRESS : deploy 新版本
+    UPDATE_IN_PROGRESS --> UPDATE_COMPLETE
+    UPDATE_IN_PROGRESS --> UPDATE_ROLLBACK_COMPLETE : 更新失敗
+    CREATE_COMPLETE --> DELETE_IN_PROGRESS
+    UPDATE_COMPLETE --> DELETE_IN_PROGRESS
+    DELETE_IN_PROGRESS --> [*]
+```
+
+**Console**：CloudFormation → 堆疊 → 選 stack →「事件」分頁看失敗原因、「輸出」分頁看 Outputs。
+
+**注意事項**
+- **建立失敗的 stack 會停在 `ROLLBACK_COMPLETE`，不能更新，只能刪除後重建**（§10-1、10-2、10-7）。
+- `aws cloudformation wait stack-rollback-complete` 只等 `UPDATE_ROLLBACK_COMPLETE`，**不適用建立失敗**（§10-8）。
+- 有 Export 被其他 stack 匯入時，被匯入的 stack 不能先刪除，所以要反向清除（§12）。
+- 不要在 Console 手動建立 template 也要建的同名資源（§10-1）。
+
+---
+
+#### 2.1.3 AWS CloudShell
+
+**是什麼**：Console 內建、以目前登入身分自動取得憑證的瀏覽器 Linux shell，已預裝 AWS CLI、git、jq、Python、Node.js、Docker。官方 FAQ 說明 **CloudShell 不另收費**，只付你在裡面操作的其他資源費用。
+
+**核心概念**
+- **每個 IAM 身分、每個 Region 各自一個環境**：`poc-admin` 和 `rbac-poc-deployer` 的家目錄互不相通，所以本次每換一個身分都要重新上傳 bundle。
+- **持久儲存**：每個 Region 的家目錄有 **1 GB** 持久空間；**最後一次開啟 session 後最多保留 120 天**。家目錄以外的變更（例如 `sudo dnf install`）在環境重啟後會消失，所以 `gh` 裝在 `~/bin`。
+- **上傳 / 下載**：「動作 → 上傳檔案 / 下載檔案」；**上傳不會覆寫同名檔案**（§10-5）。
+
+**為什麼用它**：不需要建立 access key，也不需要在本機安裝工具，符合「不使用長期金鑰」的最佳實踐。
+
+**注意事項**：長時間指令執行中如果瀏覽器分頁閒置或重新連線，session 可能中斷，但 **CloudFormation / CodeBuild 在伺服器端會繼續執行**，重新連線後用 `describe-stacks` 查狀態即可。
+
+---
+
+#### 2.1.4 Amazon VPC（含子網路、NAT、Endpoint、Security Group、Flow Logs）
+
+**是什麼**：你在 AWS 上的邏輯隔離網路。VPC、子網路、路由表、Internet Gateway、Security Group 本身**不收費**；收費的是 NAT Gateway、Public IPv4、Interface Endpoint、流量。
+
+**核心概念與本 POC 設定**
+
+| 元件 | 說明 | 本 POC |
+|---|---|---|
+| VPC | 一段私有 IP 範圍 | `10.20.0.0/16` |
+| Subnet | VPC 內的一段 IP，位於**單一 AZ** | 2 AZ × 3 層 = 6 個 |
+| Route table | 子網路的路由；有 `0.0.0.0/0 → IGW` 才叫 public subnet | public → IGW；app → NAT；data → 只有 local |
+| Internet Gateway（IGW） | VPC 與網際網路的雙向出入口 | 只給 NAT 用 |
+| NAT Gateway | 讓私有子網路**只出不進**地連外 | 1 個（參數可改 2 個） |
+| Gateway VPC Endpoint（S3） | 私有子網路走 AWS 內網存取 S3 | 讓 ECR image layer 不經 NAT |
+| Security Group（SG） | 掛在 ENI 上的**有狀態**防火牆；規則可**引用另一個 SG** | vpclink → alb → app → db 鏈 |
+| VPC Flow Logs | 記錄網路流量中繼資料 | 只記 `REJECT`，送 CloudWatch Logs |
+
+**計費（官方）**
+- Public IPv4：**US$0.005 / 小時**（使用中或閒置皆同，適用所有商業 Region）。
+- Gateway 型 VPC Endpoint：**不收小時費、不收資料處理費**。
+- NAT Gateway：官方範例（US East **Ohio**）為 **US$0.045 / 小時 + US$0.045 / GB 處理量**；us-east-1 **（未確認，通常相同）**。
+
+**注意事項**
+- NAT Gateway 是本 POC **最貴的單項**之一，而且「放著不用也照算」，POC 結束一定要刪除。
+- 本 POC 的 Fargate task 需要連外的原因：拉 ECR image、送 CloudWatch Logs、讀 Secrets Manager、**抓 Cognito 的 JWKS 公鑰**。若改用 Interface Endpoint 可以取代部分 NAT 流量，但每個 endpoint 每 AZ 都有小時費。
+
+---
+
+#### 2.1.5 Amazon Cognito（User Pool）— 取代 Keycloak + OpenLDAP
+
+**是什麼**：託管的使用者目錄與 OAuth 2.0 / OpenID Connect 身分提供者（IdP）。負責註冊、登入、MFA、密碼政策、發 JWT。
+
+**核心概念**
+
+| 概念 | 說明 | 對應 Keycloak | 本 POC |
+|---|---|---|---|
+| User Pool | 一個使用者目錄 + 一個 OIDC issuer | Realm | `rbac-poc-users` |
+| User / Attribute | 使用者與屬性；自訂屬性前綴 `custom:` | LDAP 使用者 / 屬性 | `custom:tenant_id` |
+| Group | 使用者分組，名稱進入 token 的 `cognito:groups` | Realm Role | ADMIN、TENANT_ADMIN、AUDITOR、USER、VIEWER |
+| App Client | 一個「可以向 User Pool 要 token 的應用程式」，決定允許的登入流程、可讀寫的屬性 | Client | `rbac-poc-web`、`rbac-poc-test-harness` |
+| Auth flows | SRP、`ADMIN_USER_PASSWORD_AUTH`、OAuth2 Code + PKCE、Refresh | Grant types | 見 [§4.2](#42-應用程式平面cognito--rbac--多租戶) |
+| Token | ID token（使用者是誰）、Access token（可以做什麼）、Refresh token | 同 | API 一律用 **access token** |
+| Domain / Managed login | Cognito 代管的登入頁 | Keycloak 登入頁 | `rbac-poc-<帳號ID>.auth.us-east-1.amazoncognito.com` |
+| Lambda trigger | 在註冊、登入、發 token 等時點呼叫 Lambda | SPI / Mapper | Pre Token Generation |
+| Feature plan | Lite / Essentials / Plus | — | **Essentials** |
+
+**Feature plan 與計費（官方）**
+- **新建 User Pool 預設為 Essentials**。
+- 直接登入（非 SAML/OIDC 聯合）的使用者：**每月 10,000 MAU 免費**（以帳號或 AWS Organization 計），超過後 Essentials 每 MAU **US$0.015**。
+- **Access token 客製化（Pre Token Generation 事件 V2_0 以上）只在 Essentials 與 Plus 提供**，這也是本 POC 指定 `UserPoolTier: ESSENTIALS` 的原因。
+
+**Pre Token Generation 的限制（官方）**
+- 可以新增 / 覆寫**自訂 claim**（本 POC 的 `tenant_id`、`email`、`given_name`、`family_name`），也可以調整 `scope` 與 `cognito:groups`。
+- **不能修改**：`sub`、`username`、`cognito:username`、`client_id`、`iss`、`exp`、`iat`、`token_use`、`jti`、`auth_time` 等保留 claim，以及其他 `cognito:` 前綴 claim。
+
+**Console**：Amazon Cognito → 使用者集區 → `rbac-poc-users` → 使用者 / 群組 / 應用程式用戶端 / 延伸功能（Lambda 觸發條件）。
+
+**注意事項**
+- **必填屬性（email）必須在 App Client 的 WriteAttributes 內**，否則建立 client 失敗（§10-2）。
+- 把 `custom:tenant_id` 排除在 WriteAttributes 之外，使用者就**無法自己改租戶**（驗證案例 48）。
+- Cognito access token **沒有 `aud`**，改用 `client_id`；API Gateway JWT authorizer 會比對 `client_id`，Spring Security 預設也不檢查 aud。
+
+---
+
+#### 2.1.6 AWS Lambda — Pre Token Generation trigger
+
+**是什麼**：事件觸發、依執行時間計費的無伺服器函式。本 POC 只用它做一件事：Cognito 發 token 前，把 `custom:tenant_id` 等屬性寫進 access token，等同 Keycloak 的 protocol mapper。
+
+**本 POC 設定**：Node.js 22（`nodejs22.x`）、arm64、128 MB、timeout 5 秒；程式碼見 `aws/lambda/pre-token-generation/index.js`（template 內嵌同一份）；執行角色只能寫自己的 log group；以 `AWS::Lambda::Permission` 只允許**這個 User Pool** 呼叫。
+
+**計費**：依請求數與 GB-秒計費；登入次數極少的 POC 實際費用可忽略（**本次未逐項驗證 Lambda 單價**）。
+
+**注意事項**：CloudFormation `ZipFile` 內嵌的程式碼檔名固定是 `index.js`，**要用 CommonJS（`exports.handler`）**，不能用 ESM 的 `export`。
+
+---
+
+#### 2.1.7 Amazon API Gateway（HTTP API）— 取代 Spring Cloud Gateway
+
+**是什麼**：託管的 API 入口。本 POC 用的是 **HTTP API**（另有功能較多、較貴的 REST API，以及 WebSocket API）。
+
+**核心概念**
+
+| 概念 | 說明 | 本 POC |
+|---|---|---|
+| Route | `METHOD /path` 對應到整合 | `ANY /api/{proxy+}` |
+| Integration | 請求轉送到哪裡 | `HTTP_PROXY` → 內部 ALB listener |
+| VPC Link | 讓 API Gateway 進到你的私有子網路 | `rbac-poc-vpclink` |
+| JWT Authorizer | 在邊界驗證 JWT 的簽章、`iss`、`aud` / `client_id`、`exp` | Cognito issuer + 兩個 App Client ID |
+| Stage | 部署環境；`$default` + AutoDeploy | 節流 20 rps / burst 50、JSON access log |
+
+**計費（官方）**：HTTP API 前 3 億次請求 **US$1.00 / 百萬次**（官方範例；下一級 US$0.90）；計量以 **512 KB** 為一個請求單位（由官方範例推算）。VPC Link（HTTP API）的費用頁面未列出 **（未確認）**。
+
+**HTTP API vs REST API（選 HTTP API 的取捨）**
+
+| | HTTP API | REST API |
+|---|---|---|
+| 價格 | 較便宜 | 較貴 |
+| JWT authorizer | ✅ 原生 | 需 Cognito authorizer / Lambda |
+| AWS WAF | ❌ 不能直接掛 | ✅ |
+| Usage plan / API key | ❌ | ✅ |
+| 本 POC 需求 | 足夠 | — |
+
+**注意事項**
+- JWT authorizer **只做驗證（authN）**；誰能刪商品這類授權（authZ）仍在 Spring Security 的 `@PreAuthorize`，形成縱深防禦。
+- 驗證失敗的請求在 API Gateway 就被擋下（401），**不會進到 VPC**（驗證案例 1–3）。
+
+---
+
+#### 2.1.8 Elastic Load Balancing — Application Load Balancer（ALB）
+
+**是什麼**：第 7 層（HTTP）負載平衡器，依路徑、主機等條件把請求分給不同的 target group。
+
+**核心概念**：Load balancer（`Scheme: internal` 代表只有 VPC 內的 IP）→ Listener（port 80）→ Rule（path-pattern）→ Target group（`TargetType: ip`，Fargate 每個 task 一個 IP）→ Health check（`/actuator/health`）。
+
+**本 POC 路由**
+
+| 優先序 | 路徑 | 目標 |
+|---|---|---|
+| 10 | `/api/products`、`/api/products/*` | product-service :8081 |
+| 20 | `/api/v1/audit-logs`、`/api/v1/audit-logs/*` | product-service :8081 |
+| 30 | `/api/users`、`/api/users/*` | user-service :8082 |
+| 預設 | 其他 | 固定回應 404 JSON |
+
+**計費（官方，us-east-1）**：**US$0.0225 / 小時 + US$0.008 / LCU-小時**。
+
+**注意事項**
+- **`desync_mitigation_mode` 不要設 `strictest`**：API Gateway 轉送的 GET 會被當成不合規而回 400（§10-11）。AWS 預設 `defensive` 已能防護 HTTP desync。
+- Target 健康與否完全看 health check。本次 user-service 因 schema 名稱問題讓 `/actuator/health` 回 503，被判定 unhealthy 而觸發回滾（§10-10）。
+
+---
+
+#### 2.1.9 Amazon ECS + AWS Fargate — 取代 Kind / K8s
+
+**是什麼**：ECS 是 AWS 的容器編排服務；Fargate 是它的**無伺服器運算引擎**，不用管 EC2 主機，依 task 的 vCPU / 記憶體按秒計費。
+
+**與 Kubernetes 概念對照**
+
+| ECS | Kubernetes | 本 POC |
+|---|---|---|
+| Cluster | Cluster | `rbac-poc-cluster` |
+| Task Definition | Pod spec | `rbac-poc-product-service`、`rbac-poc-user-service` |
+| Container definition | Container | `init-tmp`（init）+ `*-service` |
+| Task | Pod | 每個服務 1 個 |
+| Service | Deployment + Service | 維持 DesiredCount、接 ALB、滾動更新 |
+| Task execution role | kubelet 拉 image / 讀 secret 的權限 | `rbac-poc-ecs-execution-role` |
+| Task role | ServiceAccount（IRSA） | `rbac-poc-ecs-task-role`（零權限） |
+| `secrets`（valueFrom） | Secret → env | DB 帳密從 Secrets Manager 注入 |
+| `dependsOn: SUCCESS` | initContainers | `init-tmp` 先跑 `chmod 1777 /tmp` |
+| Deployment circuit breaker | progressDeadline + rollback | 連續失敗就自動回滾 |
+
+**計費（官方，us-east-1 Linux/x86）**：官方以每秒計價，vCPU **US$0.000011244 / 秒**、記憶體 **US$0.000001235 / GB-秒**，換算約 **US$0.0405 / vCPU-小時、US$0.00445 / GB-小時（推算）**。本 POC 每個 task 0.5 vCPU + 1 GB，約 **US$0.025 / 小時（推算）**。每個 task 預設附 **20 GB** ephemeral storage。
+
+**注意事項**
+- **Fargate 的 ephemeral bind volume 是 root:root 0755**，非 root 容器寫不進去，需要 init container 開權限（§10-6）。
+- Circuit breaker 在**首次建立**時觸發，CloudFormation 會整個 stack 回滾（連 ALB 一起刪），重建約需 10 分鐘（§10-7）。
+- Task 啟動約 60 秒（Spring Boot），本 POC 的 `HealthCheckGracePeriodSeconds` 設 240 秒，每次失敗重試間隔較長。
+
+---
+
+#### 2.1.10 Amazon ECR（Elastic Container Registry）
+
+**是什麼**：私有容器映像倉庫，與 IAM 整合，ECS 可直接拉取。
+
+**本 POC 設定**：`rbac-poc/product-service`、`rbac-poc/user-service` 兩個 repo；**不可變 tag**（`IMMUTABLE`，同一個 tag 不能被覆蓋，部署可追溯）；**推送即掃描**（basic scanning）；AES256 加密；lifecycle 保留最近 10 個 image；`EmptyOnDelete: true` 讓刪 stack 時一併清空。Base image 使用 **Amazon ECR Public** 上的 Amazon Corretto，避開 Docker Hub 拉取限制。
+
+**計費（官方）**：儲存 **US$0.10 / GB-月**；新帳號第一年每月 500 MB 私有儲存免費。
+
+---
+
+#### 2.1.11 AWS CodeBuild
+
+**是什麼**：託管的建置環境；依 `buildspec.yml` 執行指令，按建置分鐘計費，不用維護 CI 主機。
+
+**本 POC 流程**：S3 原始碼 zip → `amazonlinux-x86_64-standard:5.0`（Corretto 17）→ 單元測試（輸出 `TEST SUMMARY`）→ `bootJar` → `docker build`（需 **Privileged mode**）→ 推送 ECR。測試失敗就不推 image。JUnit 報表另存成 CodeBuild Report Group。
+
+**計費（官方）**：免費額度為每月 100 分鐘（限 general1.small / arm1.small）；general1.small 為 US$0.005 / 分（官方範例）。本 POC 用 **general1.medium**，其單價官方表格未顯示 **（未確認）**；每次建置約 1.5–3 分鐘。
+
+**注意事項**：buildspec v0.2 的所有指令在**同一個 shell** 執行，`export` 的變數可跨 phase 使用；`exported-variables` 可讓腳本取回 image tag。
+
+---
+
+#### 2.1.12 Amazon S3
+
+**是什麼**：物件儲存。本 POC 只用一個 bucket 放 CodeBuild 的原始碼 zip。
+
+**本 POC 設定**：Block Public Access 全開、`BucketOwnerEnforced`（停用 ACL）、SSE-S3 加密、版本控制、bucket policy **拒絕非 TLS 存取**、lifecycle 30 天過期。
+
+**注意事項**：**開了版本控制的 bucket 要先刪除所有版本與 delete marker 才能刪除 bucket**，`99-cleanup.sh --all` 已處理。
+
+---
+
+#### 2.1.13 Amazon RDS for PostgreSQL
+
+**是什麼**：託管的關聯式資料庫；AWS 負責主機、修補、備份、監控，你負責 schema 與查詢。
+
+**本 POC 設定**：PostgreSQL 16、`db.t4g.micro`（Graviton）、20 GB gp3（自動擴充到 50 GB）、儲存加密、參數群組 `rds.force_ssl=1`、僅在無對外路由的 data subnet、`PubliclyAccessible: false`、只允許 app SG 連 5432、**`ManageMasterUserPassword: true`**（主密碼由 RDS 產生並存進 Secrets Manager）。
+
+**Schema-per-service**：同一個 DB instance、不同 schema：`product`、`user_service`。`audit_logs` 由 `audit-lib` 的 Flyway 建立，商品表由 Hibernate 建立。
+
+**計費**：依 instance 小時、儲存 GB-月、備份與 I/O 計費。官方定價頁的 instance 與 gp3 表格未載出，本文 §11 的 `db.t4g.micro` 約 US$0.016 / 小時為**估算（未確認）**。T4g 若超用 CPU credit，官方標示 **US$0.075 / vCPU-小時**。
+
+**注意事項**
+- **`user` 是 PostgreSQL 保留字**，不能直接當 schema 名稱（§10-10）。
+- RDS 開啟 log export 時會**自己建立** CloudWatch log group，刪 stack 不會一併刪除（§12.1）。
+- Production 建議 Multi-AZ、備份 ≥ 7 天、`DeletionPolicy: Snapshot`、Deletion protection。
+
+---
+
+#### 2.1.14 AWS Secrets Manager
+
+**是什麼**：存放、加密、輪換祕密（密碼、API key）的服務。
+
+**本 POC 用法**：RDS 主密碼由 RDS **託管**（secret 名稱 `rds!db-…`），ECS task definition 以 `secrets.valueFrom: <secretArn>:password::` 在容器啟動時注入環境變數。**template、腳本、git 都沒有密碼**，execution role 只能讀這一個 secret。
+
+**計費（官方）**：**US$0.40 / secret / 月**、**US$0.05 / 1 萬次 API 呼叫**。
+
+**注意事項**：密碼輪換後，**已啟動的 task 仍拿著舊密碼**；production 要讓應用程式在連線失敗時重新取得，或輪換後滾動重啟。
+
+---
+
+#### 2.1.15 Amazon CloudWatch（Logs、Container Insights）
+
+**是什麼**：AWS 的監控與日誌服務。
+
+**本 POC 的 log groups**
+
+| Log group | 來源 | 建立者 |
+|---|---|---|
+| `/rbac-poc/product-service`、`/rbac-poc/user-service` | ECS `awslogs` driver（含 `init/` 前綴） | CloudFormation |
+| `/rbac-poc/api-gateway-access` | API Gateway access log（JSON） | CloudFormation |
+| `/rbac-poc/vpc-flow-logs` | VPC Flow Logs（REJECT） | CloudFormation |
+| `/aws/codebuild/rbac-poc-build` | CodeBuild | CloudFormation |
+| `/aws/lambda/rbac-poc-pre-token-generation` | Lambda | CloudFormation |
+| `/aws/rds/instance/rbac-poc-postgres/postgresql` | RDS log export | **RDS 自行建立** |
+| `/aws/ecs/containerinsights/rbac-poc-cluster/performance` | Container Insights | **ECS 自行建立** |
+
+**常用指令**：`aws logs tail <group> --since 10m --follow`、`aws logs filter-log-events --filter-pattern '"ERROR"'`。
+
+**計費**：依日誌寫入量、儲存量、Container Insights 指標計費；本 POC 量很小（**本次未逐項驗證 CloudWatch 單價**）。所有 CloudFormation 建立的 log group 都設 **14 天保留**，避免無限累積。
+
+---
+
+#### 2.1.16 服務選擇總結：為什麼是這些服務
+
+| 決策 | 選擇 | 沒選 | 理由 |
+|---|---|---|---|
+| IdP | Cognito Essentials | 在 EC2 / ECS 自架 Keycloak | 免維運；10,000 MAU 免費；access token 客製化 |
+| API 入口 | API Gateway HTTP API | REST API、只用 ALB | 原生 JWT authorizer、便宜；代價是不能直接掛 WAF |
+| 運算 | ECS Fargate | EKS、EC2 | 不需 K8s API；EKS control plane 另有固定月費 |
+| 資料庫 | RDS PostgreSQL | Aurora、自架 | 與原專案相容、最便宜的託管選項 |
+| 建置 | CodeBuild | GitHub Actions、本機 | 在 AWS 內執行、用 IAM role 推 ECR，不需長期金鑰 |
+| IaC | CloudFormation | CDK、Terraform | 不需額外安裝或 bootstrap；`--role-arn` 讓職責分離很直接 |
+
+#### 2.1.17 參考資料
+
+- [Amazon Cognito Pricing](https://aws.amazon.com/cognito/pricing/)
+- [Cognito — Pre token generation Lambda trigger](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-token-generation.html)
+- [Amazon API Gateway Pricing](https://aws.amazon.com/api-gateway/pricing/)
+- [AWS Fargate Pricing](https://aws.amazon.com/fargate/pricing/)
+- [Amazon VPC Pricing](https://aws.amazon.com/vpc/pricing/)
+- [Elastic Load Balancing Pricing](https://aws.amazon.com/elasticloadbalancing/pricing/)
+- [Amazon RDS for PostgreSQL Pricing](https://aws.amazon.com/rds/postgresql/pricing/)
+- [AWS Secrets Manager Pricing](https://aws.amazon.com/secrets-manager/pricing/)
+- [AWS CodeBuild Pricing](https://aws.amazon.com/codebuild/pricing/)
+- [Amazon ECR Pricing](https://aws.amazon.com/ecr/pricing/)
+- [AWS CloudShell FAQs](https://aws.amazon.com/cloudshell/faqs/)
+- [AWS Pricing Calculator](https://calculator.aws/)
+
 
 ---
 
@@ -650,7 +1075,7 @@ aws logs tail /rbac-poc/api-gateway-access --since 10m
 
 ## 11. 成本估算
 
-> ⚠️ 以下為依 us-east-1 公開定價的**估算**（本次撰寫時未逐項以 AWS Pricing Calculator 驗證，實際以帳單為準）。
+> ⚠️ 單價出處與確認程度見 [§2.1](#21-aws-服務詳解)：ALB、Fargate（由官方每秒費率推算）、Public IPv4、Secrets Manager、ECR、Cognito 已對照官方定價頁；NAT（官方範例為 Ohio）、RDS、CodeBuild general1.medium 為**未確認估算**。實際以帳單與 AWS Pricing Calculator 為準。
 
 | 資源 | 規格 | 約略單價 | 每日約 |
 |---|---|---|---|
