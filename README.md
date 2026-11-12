@@ -432,5 +432,292 @@ Stack 之間以 **CloudFormation Exports / ImportValue** 串接（例如 `rbac-p
 | `99-cleanup.sh [--all]` | deployer / poc-admin | 反向刪除 stack；`--all` 另刪 artifact bucket 與 IAM bootstrap |
 | `deploy-all.sh` | deployer | 01 → 50 一次跑完 |
 
-<!-- SECTIONS-8+ -->
+
+---
+
+## 8. Step-by-Step 部署（含截圖）
+
+> 全程在瀏覽器裡完成：**AWS Console + CloudShell**，本機不需要安裝 AWS CLI、JDK 或 Docker，也不需要建立任何 access key。
+> 截圖都在 [`docs/images/`](docs/images/)，完整時間軸見 [`docs/deployment-log.md`](docs/deployment-log.md)。
+
+### Step 0：帳號準備（root，一次性）
+
+**為什麼**：root 擁有無法被限制的權限。AWS 建議 root 只做帳號層級任務，日常改用 IAM 身分。
+
+1. 以 root 登入，開啟 CloudShell（右上角 `>_` 圖示）。
+
+   ![CloudShell](docs/images/00-cloudshell-open.jpg)
+
+2. 在 IAM Console 建立兩個 IAM User（都啟用主控台存取、**不要**建立 access key）：
+   - `poc-admin`：之後掛 `AdministratorAccess`
+   - `rbac-poc-deployer`：**不要掛任何權限**，由 Step 1 的 bootstrap 加入群組
+
+   > ⚠️ 不要手動建立 `RbacPocDeployers` 群組，否則 Step 1 會因同名衝突失敗（見 §10-1）。
+
+3. 檢查目前狀態（唯讀）：
+
+   ```bash
+   for u in poc-admin rbac-poc-deployer; do
+     printf '%-18s policies=[%s] groups=[%s] mfa=[%s] keys=[%s]\n' $u \
+       "$(aws iam list-attached-user-policies --user-name $u --query 'AttachedPolicies[].PolicyName' --output text)" \
+       "$(aws iam list-groups-for-user --user-name $u --query 'Groups[].GroupName' --output text)" \
+       "$(aws iam list-mfa-devices --user-name $u --query 'length(MFADevices)' --output text)" \
+       "$(aws iam list-access-keys --user-name $u --query 'length(AccessKeyMetadata)' --output text)"
+   done
+   echo "root: MFA=$(aws iam get-account-summary --query SummaryMap.AccountMFAEnabled --output text) AccessKeys=$(aws iam get-account-summary --query SummaryMap.AccountAccessKeysPresent --output text)"
+   ```
+
+   ![檢查前](docs/images/01-iam-users-check-before.jpg)
+
+4. 給 `poc-admin` 管理權限、設定帳號密碼政策：
+
+   ```bash
+   aws iam attach-user-policy --user-name poc-admin --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+   aws iam update-account-password-policy --minimum-password-length 14 --require-symbols --require-numbers \
+     --require-uppercase-characters --require-lowercase-characters --allow-users-to-change-password \
+     --max-password-age 90 --password-reuse-prevention 12
+   ```
+
+   ![授權與密碼政策](docs/images/02-root-attach-admin-and-password-policy.jpg)
+   ![檢查後](docs/images/03-iam-users-check-after.jpg)
+
+5. 替 `poc-admin`、`rbac-poc-deployer` 指派 MFA 裝置（IAM → 使用者 → 安全憑證 → 指派 MFA）。
+6. 若 root 有 access key：先「停用」，確認沒有程式依賴後再「刪除」：
+
+   ```bash
+   K=$(aws iam list-access-keys --query 'AccessKeyMetadata[0].AccessKeyId' --output text)
+   aws iam get-access-key-last-used --access-key-id $K --output table
+   aws iam update-access-key --access-key-id $K --status Inactive
+   aws iam delete-access-key --access-key-id $K      # 不可復原
+   ```
+
+7. 登出 root，使用 `https://<帳號ID>.signin.aws.amazon.com/console` 以 `poc-admin` 登入。
+
+### Step 1：IAM Bootstrap（poc-admin）
+
+1. 把程式碼放進 CloudShell：
+   - 方法 A：`git clone https://github.com/ChunPingWang/rbac-poc-on-aws-tutorial.git`
+   - 方法 B（離線 / 私有 repo）：本機 `git bundle create rbac-poc.bundle main`，CloudShell「動作 → 上傳檔案」上傳後 `git clone rbac-poc.bundle rbac-poc-on-aws-tutorial`
+
+   ![上傳檔案](docs/images/05-cloudshell-actions-upload.jpg)
+   ![clone 與驗證](docs/images/06-clone-bundle-validate.jpg)
+
+2. 執行 bootstrap：
+
+   ```bash
+   cd ~/rbac-poc-on-aws-tutorial
+   ./aws/scripts/00-bootstrap-iam.sh
+   ```
+
+   腳本會：拒絕 root 執行 → 偵測 `rbac-poc-deployer` 是否已存在（已存在則只加入群組）→ 部署 `rbac-poc-00-bootstrap-iam`。
+
+   ![bootstrap 成功](docs/images/09-bootstrap-success.jpg)
+
+3. 驗證群組與政策：
+
+   ![群組驗證](docs/images/10-bootstrap-verify-group.jpg)
+
+### Step 2：以 deployer 登入並 preflight
+
+```bash
+# 以 rbac-poc-deployer（含 MFA）登入 → us-east-1 → CloudShell
+# 每個 IAM User 的 CloudShell 家目錄是獨立的，需重新 clone / 上傳
+./aws/scripts/01-preflight.sh
+```
+
+![deployer 身分](docs/images/11-deployer-identity.jpg)
+![preflight](docs/images/12-deployer-preflight.jpg)
+
+### Step 3：基礎設施（network → data ∥ identity → build）
+
+```bash
+./aws/scripts/10-deploy-foundation.sh
+```
+
+![identity / build 完成](docs/images/14-identity-build-stacks-ok.jpg)
+
+### Step 4：在 CodeBuild 測試、建置、推送 image
+
+```bash
+./aws/scripts/20-build-images.sh
+```
+
+CodeBuild 依序執行：`security-lib` / `tenant-lib` / `product-service` / `user-service` 單元測試 → `bootJar` → `docker build`（Corretto 17 from ECR Public）→ 推送 ECR（不可變 tag，例如 `20261112114918-3`）。測試失敗不會推送 image。
+
+![CodeBuild 成功](docs/images/15-codebuild-success.jpg)
+
+### Step 5：部署 ECS、ALB、API Gateway
+
+```bash
+./aws/scripts/30-deploy-services.sh
+```
+
+<!-- STEP5-IMAGES -->
+
+### Step 6：建立測試帳號
+
+```bash
+./aws/scripts/40-seed-users.sh
+```
+
+<!-- STEP6-IMAGES -->
+
+### Step 7：端到端驗證
+
+```bash
+./aws/scripts/50-verify.sh
+```
+
+<!-- STEP7-IMAGES -->
+
+
+---
+
+## 9. 驗證結果
+
+<!-- VERIFY-RESULTS -->
+
+---
+
+## 10. 疑難排解（實際踩到的坑）
+
+以下都是本次實際部署時遇到、已修正並寫回 template / 程式的問題，依發生順序排列：
+
+| # | 階段 | 症狀 | 根因 | 修正 |
+|---|---|---|---|---|
+| 10-1 | Step 1 bootstrap | `AWS::IAM::Group 'RbacPocDeployers' already exists` → ROLLBACK_COMPLETE | 事先在 Console 手動建立了同名空群組 | 刪除空的 stack 與空群組後重跑；**IAM 資源一律交給 IaC 建立** |
+| 10-2 | Step 3 identity | `Invalid write attributes specified while creating a client` | User Pool 的**必填屬性（email）必須在 App Client 的 WriteAttributes 內** | WriteAttributes 改為 `[email, given_name, family_name]`；`custom:tenant_id` 仍不可寫 |
+| 10-3 | Step 4 CodeBuild | product-service 128 個測試中 22 個失敗，`NoSuchBeanDefinitionException` | 原專案在 `@SpringBootApplication` 類別上加了 `@EnableJpaRepositories`，所有 `@WebMvcTest` slice 都被迫建立 JPA Repository（**原專案既有回歸**，由 git 歷史確認：該註解晚於 Controller 測試加入） | 移到獨立的 `config/JpaConfig` |
+| 10-4 | Step 4 CodeBuild | deployer 執行 `describe-test-cases` 被拒 | 最小權限：`RbacPocDeployerPolicy` 未授權讀取 CodeBuild 報表 | 不放寬權限，改由 buildspec 在 log 中輸出 `TEST SUMMARY` 與失敗細節 |
+| 10-5 | Step 4 CloudShell | 上傳同名檔案失敗：「已存在於環境中，不會被覆寫」 | CloudShell 上傳不覆寫既有檔案 | 每次用不同檔名（`rbac-poc-v3.bundle`），或先 `rm` |
+| 10-6 | Step 5 ECS | Task 反覆重啟：`Unable to create tempDir. java.io.tmpdir is set to /tmp` / `AccessDeniedException` | Fargate 的 ephemeral bind volume 為 `root:root 0755`，非 root（UID 65532）容器無法寫入 | 加入 **init container**（以 root 執行 `chmod 1777 /tmp` 後結束），app 容器 `DependsOn: SUCCESS`；仍維持非 root + 唯讀 root FS |
+| 10-7 | Step 5 ECS | 失敗後 stack 進入 ROLLBACK_COMPLETE | ECS Deployment Circuit Breaker 在 3 個 task 失敗後判定部署失敗，CloudFormation 回滾（**這正是預期的保護機制**） | `delete-stack` 後重新部署 |
+| 10-8 | 重新部署前 | `aws cloudformation wait stack-rollback-complete` 一直等不到 | 該 waiter 只認 `UPDATE_ROLLBACK_COMPLETE`；**建立失敗**的回滾狀態是 `ROLLBACK_COMPLETE` | 直接 `describe-stacks` 檢查狀態後 `delete-stack` |
+| 10-9 | Step 5 ECS | init container 成功（`tmp-ready`）後，app 啟動失敗：`Unable to determine source type <S> and target type <T> for your Converter` | **本次改造引入的錯誤**：把 JWT converter 寫成 lambda `@Bean`；Spring MVC 會把所有 `Converter` bean 註冊進 conversion service，lambda 的泛型無法解析。slice 測試不載入 SecurityConfig，所以單元測試沒抓到 | 改為具名類別 `PrincipalAwareJwtAuthenticationConverter`，並新增「可註冊進 conversion service」的回歸測試 |
+<!-- TROUBLE-EXTRA -->
+
+**通用除錯指令**
+
+```bash
+# 某個 stack 失敗的原因
+aws cloudformation describe-stack-events --stack-name <stack> \
+  --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatusReason]" --output text
+# ECS 部署狀態
+aws ecs describe-services --cluster rbac-poc-cluster --services rbac-poc-product-service rbac-poc-user-service \
+  --query 'services[].[serviceName,runningCount,deployments[0].rolloutState,deployments[0].failedTasks]' --output text
+# 應用程式 log
+aws logs tail /rbac-poc/product-service --since 10m --follow
+# API Gateway access log（含 JWT authorizer 錯誤）
+aws logs tail /rbac-poc/api-gateway-access --since 10m
+```
+
+---
+
+## 11. 成本估算
+
+> ⚠️ 以下為依 us-east-1 公開定價的**估算**（本次撰寫時未逐項以 AWS Pricing Calculator 驗證，實際以帳單為準）。
+
+| 資源 | 規格 | 約略單價 | 每日約 |
+|---|---|---|---|
+| NAT Gateway | 1 個 | ~US$0.045 / 小時 + 流量 | ~US$1.1 |
+| NAT 的 Public IPv4 | 1 個 | ~US$0.005 / 小時 | ~US$0.12 |
+| Internal ALB | 1 個 | ~US$0.0225 / 小時 + LCU | ~US$0.55 |
+| ECS Fargate | 2 task × 0.5 vCPU / 1 GB | ~US$0.025 / task-小時 | ~US$1.2 |
+| RDS PostgreSQL | db.t4g.micro + 20 GB gp3 | ~US$0.016 / 小時 | ~US$0.45 |
+| API Gateway HTTP API | 測試流量 | ~US$1 / 百萬次 | ≈ 0 |
+| Cognito Essentials | 6 個測試使用者 | 免費額度內 | ≈ 0 |
+| CodeBuild | general1.medium，每次約 3 分鐘 | ~US$0.01 / 分 | 每次 ~US$0.03 |
+| CloudWatch Logs / Container Insights / Secrets Manager / ECR | 少量 | | < US$0.3 |
+| **合計** | | | **約 US$3.5 / 天** |
+
+**最大宗是 NAT Gateway 與 Fargate**。POC 結束務必執行 [§12](#12-清除所有計費資源)。
+
+---
+
+## 12. 清除所有計費資源
+
+```bash
+# (1) deployer：反向刪除 60 → 10（ECR 設 EmptyOnDelete，image 一併刪除）
+./aws/scripts/99-cleanup.sh
+
+# (2) poc-admin：清空並刪除 artifact bucket（含所有版本）、刪除 IAM bootstrap
+./aws/scripts/99-cleanup.sh --all
+```
+
+刪除順序與原因：
+
+| 順序 | Stack | 為什麼要這個順序 |
+|---|---|---|
+| 1 | 60-api | 參照 ALB listener、Cognito、子網路 |
+| 2 | 50-services | 參照 ECR、RDS、Cognito、網路 |
+| 3 | 40-build | ECR repo（`EmptyOnDelete: true`） |
+| 4 | 30-identity | User Pool、Lambda |
+| 5 | 20-data | RDS（`DeletionPolicy: Delete`，POC 不留 snapshot） |
+| 6 | 10-network | NAT、EIP、VPC |
+| 7 | 00-bootstrap-iam | 需 admin；先清空 versioned bucket |
+
+清除後的確認清單（全部應為空）：
+
+```bash
+aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE ROLLBACK_COMPLETE \
+  --query "StackSummaries[?starts_with(StackName,'rbac-poc')].StackName" --output text
+aws ec2 describe-nat-gateways --filter Name=state,Values=available,pending --query 'NatGateways[].NatGatewayId' --output text
+aws ec2 describe-addresses --query 'Addresses[].PublicIp' --output text
+aws rds describe-db-instances --query "DBInstances[?starts_with(DBInstanceIdentifier,'rbac-poc')].DBInstanceIdentifier" --output text
+aws elbv2 describe-load-balancers --query "LoadBalancers[?starts_with(LoadBalancerName,'rbac-poc')].LoadBalancerName" --output text
+aws ecs list-clusters --query "clusterArns[?contains(@,'rbac-poc')]" --output text
+aws ecr describe-repositories --query "repositories[?starts_with(repositoryName,'rbac-poc')].repositoryName" --output text
+aws logs describe-log-groups --log-group-name-prefix /rbac-poc --query 'logGroups[].logGroupName' --output text
+```
+
+> IAM User（`poc-admin`、`rbac-poc-deployer`）與帳號密碼政策**不計費**，由帳號擁有者決定是否保留。
+
+<!-- CLEANUP-RESULT -->
+
+---
+
+## 13. 走向 Production 的強化建議
+
+| 項目 | POC 現況 | Production 建議 |
+|---|---|---|
+| 人員身分 | IAM User + MFA | **IAM Identity Center**（SSO、短期憑證、Permission Set）；多帳號 Landing Zone（Control Tower） |
+| API → ALB | VPC Link 後為 HTTP | ALB 掛 ACM 憑證改 HTTPS（需自有網域） |
+| WAF | HTTP API 不支援直接掛 WAF | 前置 CloudFront + WAF，或改用 REST API + WAF |
+| 東西向 mTLS | 未部署（SG 鏈取代） | VPC Lattice（IAM auth）或 ECS Service Connect TLS + AWS Private CA（short-lived 模式較便宜） |
+| Token 型別 | 服務端接受任何同 issuer token | 加 `token_use == access` 驗證（自訂 `JwtDecoder` validator） |
+| 威脅防護 | Cognito Essentials | Cognito Plus：threat protection（自適應驗證、外洩密碼偵測） |
+| 資料庫 | 單 AZ、備份 1 天、DeletionPolicy Delete | Multi-AZ 或 Aurora、備份 ≥ 7 天、Snapshot / Retain、Deletion protection、IAM DB auth |
+| 秘密輪換 | RDS 託管（預設 7 天自動輪換） | 應用程式支援連線重建；監控輪換失敗 |
+| 網路 | 單一 NAT | 每 AZ 一個 NAT（參數 `NatGatewayCount=2`）或 VPC Endpoints |
+| 偵測 | CloudWatch Logs | GuardDuty、Security Hub、CloudTrail（多 Region、log file validation）、AWS Config |
+| CI/CD | 手動執行腳本 | CodePipeline / GitHub Actions + OIDC（不使用長期金鑰）、image 簽章 |
+| 擴展 | DesiredCount 1 | ECS Service Auto Scaling、多 AZ task 分散 |
+
+---
+
+## 14. Repo 結構
+
+```
+rbac-poc-on-aws-tutorial/
+├── README.md                      ← 本教學
+├── aws/                           ← ★ AWS 版本新增
+│   ├── cloudformation/            00-bootstrap-iam … 60-api
+│   ├── codebuild/buildspec.yml
+│   ├── docker/Dockerfile.{product,user}-service
+│   ├── lambda/pre-token-generation/index.js
+│   └── scripts/                   env / 00 / 01 / 10 / 20 / 30 / 40 / 50 / 99 / deploy-all
+├── docs/
+│   ├── images/                    ← 部署過程截圖
+│   ├── deployment-log.md          ← 實際部署時間軸
+│   ├── verify-report.md           ← 驗證報告（自動產生）
+│   └── original/                  ← 原專案 README / PRD / TECH / INFRA
+├── libs/                          security-lib / tenant-lib / audit-lib / common-lib
+├── services/                      product-service / user-service / gateway-service（保留）
+├── apps/rbac-demo/                （保留）
+├── deploy/                        docker / k8s / scripts（原專案，全部保留）
+├── specs/                         原專案 spec-kit
+└── tests/scenario-tests/          Cucumber BDD（保留）
+```
+
+
 

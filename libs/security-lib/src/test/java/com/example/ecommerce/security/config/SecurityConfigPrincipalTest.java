@@ -33,6 +33,14 @@ class SecurityConfigPrincipalTest {
     }
 
     @Test
+    @DisplayName("converter bean can be registered in Spring MVC conversion service (generic types resolvable)")
+    void registrableInConversionService() {
+        var cs = new org.springframework.format.support.DefaultFormattingConversionService();
+        org.assertj.core.api.Assertions.assertThatCode(
+            () -> cs.addConverter(new SecurityConfig().jwtAuthenticationConverter())).doesNotThrowAnyException();
+    }
+
+    @Test
     @DisplayName("fallback to sub")
     void fallbackToSub() {
         assertThat(SecurityConfig.resolvePrincipalName(base().claim("scope", "x").build())).isEqualTo("uuid-sub");
