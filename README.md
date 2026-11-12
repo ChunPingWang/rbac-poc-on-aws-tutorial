@@ -35,6 +35,7 @@
 11. [成本估算](#11-成本估算)
 12. [清除所有計費資源](#12-清除所有計費資源)
 13. [走向 Production 的強化建議](#13-走向-production-的強化建議)
+   - [13.1 東西向 mTLS 與 AWS Private CA 的替代方案](#131-東西向-mtls-與-aws-private-ca-的替代方案)
 14. [Repo 結構](#14-repo-結構)
 
 ---
@@ -82,7 +83,7 @@
 | PostgreSQL / H2 | **Amazon RDS for PostgreSQL 16** | 加密、強制 TLS、密碼由 **Secrets Manager** 託管（`ManageMasterUserPassword`） |
 | Docker build / registry | **AWS CodeBuild + Amazon ECR** | 在 AWS 內跑單元測試 → 打包 → 建 image；ECR 不可變 tag + 推送即掃描 |
 | docker logs / kubectl logs | **Amazon CloudWatch Logs**、Container Insights、VPC Flow Logs | |
-| cert-manager mTLS（東西向） | **未部署**（見 [§13](#13-走向-production-的強化建議)） | AWS Private CA 一般模式每月約 US$400；POC 以 Security Group 鏈 + 私有子網路取代，正式環境可用 VPC Lattice / Service Connect TLS |
+| cert-manager mTLS（東西向） | **未部署**（見 [§13.1](#131-東西向-mtls-與-aws-private-ca-的替代方案)） | AWS Private CA 一般模式 US$400 / CA / 月、short-lived 模式 US$50 / CA / 月；POC 以 Security Group 鏈 + 私有子網路取代 |
 | Spring Cloud Gateway 的 CORS | API Gateway `CorsConfiguration` | |
 
 ### 2.1 AWS 服務詳解
@@ -1155,7 +1156,7 @@ aws logs describe-log-groups --log-group-name-prefix /rbac-poc --query 'logGroup
 | 人員身分 | IAM User + MFA | **IAM Identity Center**（SSO、短期憑證、Permission Set）；多帳號 Landing Zone（Control Tower） |
 | API → ALB | VPC Link 後為 HTTP | ALB 掛 ACM 憑證改 HTTPS（需自有網域） |
 | WAF | HTTP API 不支援直接掛 WAF | 前置 CloudFront + WAF，或改用 REST API + WAF |
-| 東西向 mTLS | 未部署（SG 鏈取代） | VPC Lattice（IAM auth）或 ECS Service Connect TLS + AWS Private CA（short-lived 模式較便宜） |
+| 東西向 mTLS | 未部署（SG 鏈取代） | 見 [§13.1](#131-東西向-mtls-與-aws-private-ca-的替代方案)：ECS 建議 Service Connect TLS + Private CA **short-lived 模式** |
 | Token 型別 | 服務端接受任何同 issuer token | 加 `token_use == access` 驗證（自訂 `JwtDecoder` validator） |
 | 威脅防護 | Cognito Essentials | Cognito Plus：threat protection（自適應驗證、外洩密碼偵測） |
 | 資料庫 | 單 AZ、備份 1 天、DeletionPolicy Delete | Multi-AZ 或 Aurora、備份 ≥ 7 天、Snapshot / Retain、Deletion protection、IAM DB auth |
@@ -1164,6 +1165,57 @@ aws logs describe-log-groups --log-group-name-prefix /rbac-poc --query 'logGroup
 | 偵測 | CloudWatch Logs | GuardDuty、Security Hub、CloudTrail（多 Region、log file validation）、AWS Config |
 | CI/CD | 手動執行腳本 | CodePipeline / GitHub Actions + OIDC（不使用長期金鑰）、image 簽章 |
 | 擴展 | DesiredCount 1 | ECS Service Auto Scaling、多 AZ task 分散 |
+
+### 13.1 東西向 mTLS 與 AWS Private CA 的替代方案
+
+原專案以 **cert-manager + Spring Boot SSL Bundle** 做服務間 mTLS（見 [`docs/original/README.md`](docs/original/README.md) 的 mTLS 章節）。搬到 ECS 後沒有 Kubernetes，cert-manager 不能直接沿用。本 POC 先以「私有子網路 + Security Group 鏈（只允許 ALB → app）」降低風險，但這**不等於** mTLS：SG 只限制網路來源，不驗證服務身分，流量也沒有加密。
+
+#### AWS Private CA 的兩種模式（官方定價）
+
+| 模式 | CA 月費 | 憑證費用 | 憑證效期 | 適合 |
+|---|---|---|---|---|
+| General-purpose | **US$400 / CA / 月** | 前 1,000 張 US$0.75 / 張（1,001–10,000 張 US$0.35；10,001 張以上 US$0.001） | 可自訂、可長效 | 需要長效憑證、對外 / 跨組織的 PKI |
+| **Short-lived** | **US$50 / CA / 月** | US$0.058 / 張 | 最長 7 天 | 自動輪換的服務間 mTLS（**ECS Service Connect 建議**） |
+
+- 每個帳號、每個 Region 的**第一個 Private CA 前 30 天免 CA 月費**（簽發的憑證仍要付費）。試用後不再使用請刪除 CA，否則開始計月費。
+- 若啟用 OCSP，另有 US$0.06 / 憑證 / 月 + US$0.20 / 10 萬次查詢。
+
+#### 替代方案比較
+
+| # | 方案 | 約略成本 | 運作方式 | 優點 | 缺點 / 注意 |
+|---|---|---|---|---|---|
+| A | **ECS Service Connect TLS + Private CA（short-lived）** | US$50 / 月 + 每張 US$0.058 | 把 ECS service 指向 Private CA，ECS 自動簽發憑證並在 sidecar 代理加密；官方預設每 5 天輪換 | 全託管、自動輪換、程式不用改 | 需要 Private CA（CA 需加 tag `AmazonECSManaged: true`）；私鑰由 Service Connect 存於 Secrets Manager |
+| B | **自建 CA + Secrets Manager**（OpenSSL / smallstep `step-ca` / HashiCorp Vault PKI） | 無 CA 費用；每個 secret US$0.40 / 月 | 自己簽發服務憑證，存進 Secrets Manager，以 init container 或 `secrets` 掛進容器 | 幾乎零成本；**可直接沿用原專案的 Spring Boot SSL Bundle mTLS 程式** | 簽發、輪換、撤銷、CA 金鑰保護都要自己負責；`step-ca` / Vault 本身也要部署與維運 |
+| C | **cert-manager**（原專案做法） | 免費（EKS 叢集另計） | K8s 內自動簽發與輪換 | 原專案已驗證 | **需要 Kubernetes**，只適合改用 EKS 時 |
+| D | **Istio / service mesh 內建 CA**（如 istiod） | 免費（EKS 另計） | Sidecar 自動 mTLS | 透明、功能完整 | 需要 EKS，mesh 維運成本高 |
+| E | **服務 Token（OAuth2 client credentials）+ 一般 TLS** | 極低（Cognito M2M 依用量計費） | 服務以 Cognito 發的 access token 互相驗證身分；傳輸用一般 TLS | 原 `audit-lib` 已有 `ServiceTokenProvider` / `ServiceAuthInterceptor` | 只做身分驗證，**不是 mTLS**；仍需處理傳輸加密 |
+| F | **VPC Lattice + IAM auth policy** | 依服務小時、流量與請求數計費 | 以 IAM 簽章控制服務間存取，不需管理客戶端憑證 | 不用 PKI 也能做服務級授權 | 是否需要 Private CA、TLS 由誰終結，**本次未從官方文件確認**；導入前請查閱 Lattice 文件 |
+
+> **AWS App Mesh 不建議採用**：依目前所知 App Mesh 已排定於 2026-09-30 終止支援，**撰寫本文時未再次確認其現況**；新專案請改用 Service Connect 或 VPC Lattice。
+
+#### 選擇建議
+
+```mermaid
+flowchart TD
+    Q1{要跑在 Kubernetes 嗎？} -->|是 EKS| C[C. cert-manager<br/>或 D. Istio]
+    Q1 -->|否，ECS| Q2{是教學 / POC<br/>且要壓低成本？}
+    Q2 -->|是| B[B. 自建 CA + Secrets Manager<br/>沿用原專案 SSL Bundle]
+    Q2 -->|否，Production| Q3{需要的是加密 + 身分<br/>還是只要授權？}
+    Q3 -->|加密 + 服務身分| A[A. Service Connect TLS<br/>+ Private CA short-lived]
+    Q3 -->|服務級授權為主| F[F. VPC Lattice + IAM auth<br/>（導入前確認 TLS 細節）]
+    A -.可再疊加.-> E[E. 服務 Token]
+    B -.可再疊加.-> E
+```
+
+| 情境 | 建議 | 每月約略 CA 相關成本 |
+|---|---|---|
+| 本教學 / 個人 POC | **B. 自建 CA + Secrets Manager** | 每個服務憑證 secret US$0.40 |
+| 企業 POC（短期驗證 Private CA） | **A**，善用首個 CA 的 30 天免月費 | 憑證費 US$0.058 / 張；試用後務必刪除 CA |
+| Production on ECS | **A. Service Connect TLS + Private CA short-lived** | US$50 / CA + 憑證費 |
+| Production on EKS | **C. cert-manager**（可搭配 Private CA 當上游 issuer）或 **D** | 依是否使用 Private CA |
+| 銀行 / 金融合規（需完整 PKI、稽核、撤銷） | **Private CA general-purpose** 作為 root / subordinate，搭配 A 或 C | US$400 / CA 起 |
+
+參考：[AWS Private CA Pricing](https://aws.amazon.com/private-ca/pricing/)、[Amazon ECS Service Connect TLS](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-connect-tls.html)、[Amazon VPC Lattice Pricing](https://aws.amazon.com/vpc/lattice/pricing/)
 
 ---
 
