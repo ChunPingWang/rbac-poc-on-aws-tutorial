@@ -1,0 +1,23 @@
+# ------------------------------------------------------------
+# user-service image for AWS (ECS Fargate)
+#  - Base image: Amazon Corretto 17 from Amazon ECR Public
+#    (avoids Docker Hub rate limits in CodeBuild)
+#  - Runs as non-root (UID 65532), works with readonlyRootFilesystem
+#    (/tmp is an ECS ephemeral bind mount)
+# ------------------------------------------------------------
+FROM public.ecr.aws/amazoncorretto/amazoncorretto:17-al2023-headless
+
+LABEL org.opencontainers.image.title="rbac-poc-user-service" \
+      org.opencontainers.image.source="https://github.com/ChunPingWang/rbac-poc-on-aws-tutorial"
+
+WORKDIR /app
+COPY services/user-service/build/libs/user-service-1.0.0-SNAPSHOT.jar /app/app.jar
+
+ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Djava.io.tmpdir=/tmp" \
+    SPRING_PROFILES_ACTIVE=aws \
+    SERVER_PORT=8082
+
+USER 65532:65532
+EXPOSE 8082
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]

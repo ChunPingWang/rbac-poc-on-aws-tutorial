@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  rbac-poc-on-aws / 10 - Network. 3-tier VPC across 2 AZs:
+  public (NAT only) / private-app (ECS, internal ALB, VPC Link) / private-data (RDS, no route to internet).
+  Security groups are chained: VPC Link -> ALB -> App -> DB. VPC Flow Logs enabled.
+
+Parameters:
+  ProjectName: { Type: String, Default: rbac-poc }
+  VpcCidr: { Type: String, Default: 10.20.0.0/16 }
+  NatGatewayCount:
+    Type: Number
+    Default: 1
+    AllowedValues: [1, 2]
+    Description: 1 = cost-optimised POC, 2 = one NAT per AZ (production HA)
+
+Conditions:
+  TwoNat: !Equals [!Ref NatGatewayCount, 2]
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-vpc' }, { Key: Project, Value: !Ref ProjectName }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-igw' }]
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw }
+
+  # ---------------- Subnets ----------------
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 16, 8]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-a' }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 16, 8]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-b' }]
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 16, 8]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-app-a' }]
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 16, 8]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-app-b' }]
+  DataSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [8, !Cidr [!Ref VpcCidr, 16, 8]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-data-a' }]
+  DataSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [9, !Cidr [!Ref VpcCidr, 16, 8]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-data-b' }]
+
+  # ---------------- Routing ----------------
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc, Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-rt' }] }
+  PublicDefault:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: { RouteTableId: !Ref PublicRt, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw }
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRt }
+  PublicAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRt }
+
+  NatEipA:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttach
+    Properties: { Domain: vpc, Tags: [{ Key: Name, Value: !Sub '${ProjectName}-nat-a' }] }
+  NatA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-nat-a' }]
+  NatEipB:
+    Type: AWS::EC2::EIP
+    Condition: TwoNat
+    DependsOn: IgwAttach
+    Properties: { Domain: vpc }
+  NatB:
+    Type: AWS::EC2::NatGateway
+    Condition: TwoNat
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-nat-b' }]
+
+  AppRtA:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc, Tags: [{ Key: Name, Value: !Sub '${ProjectName}-app-rt-a' }] }
+  AppRtB:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc, Tags: [{ Key: Name, Value: !Sub '${ProjectName}-app-rt-b' }] }
+  AppDefaultA:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref AppRtA, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatA }
+  AppDefaultB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref AppRtB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [TwoNat, !Ref NatB, !Ref NatA]
+  AppAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnetA, RouteTableId: !Ref AppRtA }
+  AppAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnetB, RouteTableId: !Ref AppRtB }
+
+  # Data tier: no default route at all (isolated)
+  DataRt:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc, Tags: [{ Key: Name, Value: !Sub '${ProjectName}-data-rt' }] }
+  DataAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DataSubnetA, RouteTableId: !Ref DataRt }
+  DataAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DataSubnetB, RouteTableId: !Ref DataRt }
+
+  # S3 gateway endpoint (free): ECR image layers are pulled from S3 without NAT data charges
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref AppRtA, !Ref AppRtB]
+
+  # ---------------- Security groups (chained, least privilege) ----------------
+  VpcLinkSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API Gateway VPC Link ENIs
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref VpcCidr, Description: to internal ALB }
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-vpclink-sg' }]
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB - only reachable from the VPC Link
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref VpcLinkSg, Description: from VPC Link }
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-alb-sg' }]
+  AppSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks - only reachable from ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8081, ToPort: 8082, SourceSecurityGroupId: !Ref AlbSg, Description: from ALB }
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: AWS APIs / Cognito JWKS via NAT }
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-app-sg' }]
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS PostgreSQL - only reachable from ECS tasks
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref AppSg, Description: from app }
+      SecurityGroupEgress:
+        - { IpProtocol: '-1', CidrIp: 127.0.0.1/32, Description: deny all egress }
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-db-sg' }]
+  AlbToApp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSg
+      IpProtocol: tcp
+      FromPort: 8081
+      ToPort: 8082
+      DestinationSecurityGroupId: !Ref AppSg
+      Description: to ECS tasks
+  AppToDb:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AppSg
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DbSg
+      Description: to RDS
+
+  # ---------------- VPC Flow Logs ----------------
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/vpc-flow-logs'
+      RetentionInDays: 14
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-vpc-flowlogs-role'
+      PermissionsBoundary: !ImportValue
+        Fn::Sub: '${ProjectName}-workload-boundary-arn'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: vpc-flow-logs.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' } }
+      Policies:
+        - PolicyName: write-flow-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !Sub '${FlowLogGroup.Arn}'
+  FlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref Vpc
+      ResourceType: VPC
+      TrafficType: REJECT
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+
+Outputs:
+  VpcId: { Value: !Ref Vpc, Export: { Name: !Sub '${ProjectName}-vpc-id' } }
+  VpcCidr: { Value: !Ref VpcCidr, Export: { Name: !Sub '${ProjectName}-vpc-cidr' } }
+  AppSubnetIds:
+    Value: !Join [',', [!Ref AppSubnetA, !Ref AppSubnetB]]
+    Export: { Name: !Sub '${ProjectName}-app-subnets' }
+  DataSubnetIds:
+    Value: !Join [',', [!Ref DataSubnetA, !Ref DataSubnetB]]
+    Export: { Name: !Sub '${ProjectName}-data-subnets' }
+  VpcLinkSgId: { Value: !Ref VpcLinkSg, Export: { Name: !Sub '${ProjectName}-vpclink-sg' } }
+  AlbSgId: { Value: !Ref AlbSg, Export: { Name: !Sub '${ProjectName}-alb-sg' } }
+  AppSgId: { Value: !Ref AppSg, Export: { Name: !Sub '${ProjectName}-app-sg' } }
+  DbSgId: { Value: !Ref DbSg, Export: { Name: !Sub '${ProjectName}-db-sg' } }

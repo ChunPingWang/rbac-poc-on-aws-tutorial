@@ -1,6 +1,7 @@
 package com.example.ecommerce.product.adapter.inbound.rest;
 
 import com.example.ecommerce.common.dto.PagedResult;
+import com.example.ecommerce.common.exception.ResourceNotFoundException;
 import com.example.ecommerce.product.application.dto.ProductView;
 import com.example.ecommerce.product.application.port.input.query.*;
 import com.example.ecommerce.product.application.service.ProductQueryService;
@@ -40,6 +41,18 @@ class ProductQueryControllerTest {
             UUID id = UUID.randomUUID();
             mockMvc.perform(get("/api/products/" + id))
                 .andExpect(status().isUnauthorized());
+        }
+
+        @Test
+        @WithMockUser(roles = {"USER"})
+        @DisplayName("should return 404 (not 500) when product is missing or belongs to another tenant")
+        void shouldReturn404WhenNotFound() throws Exception {
+            when(queryService.handle(any(GetProductByIdQuery.class)))
+                .thenThrow(new ResourceNotFoundException("Product", UUID.randomUUID()));
+
+            mockMvc.perform(get("/api/products/{id}", UUID.randomUUID()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.errorCode").value("RESOURCE_NOT_FOUND"));
         }
 
         @Test

@@ -58,6 +58,7 @@ public class ProductCommandService {
     public void handle(UpdateProductCommand cmd) {
         Product product = productRepository.findById(ProductId.of(cmd.productId()))
             .orElseThrow(() -> new ResourceNotFoundException("Product", cmd.productId()));
+        TenantAccessGuard.requireAccessible(product, cmd.productId());
 
         String currentUser = SecurityUtils.getCurrentUsername().orElse("system");
 
@@ -71,6 +72,7 @@ public class ProductCommandService {
     public void handle(DeleteProductCommand cmd) {
         Product product = productRepository.findById(ProductId.of(cmd.productId()))
             .orElseThrow(() -> new ResourceNotFoundException("Product", cmd.productId()));
+        TenantAccessGuard.requireAccessible(product, cmd.productId());
 
         String currentUser = SecurityUtils.getCurrentUsername().orElse("system");
         product.delete(currentUser);

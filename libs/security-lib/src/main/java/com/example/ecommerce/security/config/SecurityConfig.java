@@ -1,5 +1,7 @@
 package com.example.ecommerce.security.config;
 
+import com.example.ecommerce.security.converter.CognitoGroupsRoleConverter;
+import com.example.ecommerce.security.converter.CompositeRoleConverter;
 import com.example.ecommerce.security.converter.KeycloakRoleConverter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -7,7 +9,11 @@ import org.springframework.security.config.annotation.method.configuration.Enabl
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.core.convert.converter.Converter;
+import org.springframework.security.authentication.AbstractAuthenticationToken;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
 import org.springframework.security.web.SecurityFilterChain;
 
 /**
@@ -37,10 +43,31 @@ public class SecurityConfig {
         return http.build();
     }
 
+    /**
+     * JWT → Authentication 轉換：
+     * <ul>
+     *   <li>角色：同時支援 Keycloak（realm_access / realm_roles）與 Cognito（cognito:groups）</li>
+     *   <li>Principal 名稱：依序取 username（Cognito access token）→ preferred_username（Keycloak）→ sub</li>
+     * </ul>
+     */
     @Bean
-    public JwtAuthenticationConverter jwtAuthenticationConverter() {
-        JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
-        converter.setJwtGrantedAuthoritiesConverter(new KeycloakRoleConverter());
-        return converter;
+    public Converter<Jwt, AbstractAuthenticationToken> jwtAuthenticationConverter() {
+        JwtAuthenticationConverter delegate = new JwtAuthenticationConverter();
+        delegate.setJwtGrantedAuthoritiesConverter(
+            new CompositeRoleConverter(new KeycloakRoleConverter(), new CognitoGroupsRoleConverter()));
+        return jwt -> {
+            AbstractAuthenticationToken token = delegate.convert(jwt);
+            return new JwtAuthenticationToken(jwt, token.getAuthorities(), resolvePrincipalName(jwt));
+        };
+    }
+
+    static String resolvePrincipalName(Jwt jwt) {
+        for (String claim : new String[] {"username", "preferred_username", "cognito:username"}) {
+            String v = jwt.getClaimAsString(claim);
+            if (v != null && !v.isBlank()) {
+                return v;
+            }
+        }
+        return jwt.getSubject();
     }
 }

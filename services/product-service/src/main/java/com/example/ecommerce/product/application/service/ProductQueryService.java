@@ -27,6 +27,7 @@ public class ProductQueryService {
     public ProductView handle(GetProductByIdQuery query) {
         Product product = productRepository.findById(ProductId.of(query.productId()))
             .orElseThrow(() -> new ResourceNotFoundException("Product", query.productId()));
+        TenantAccessGuard.requireAccessible(product, query.productId());
         return toView(product);
     }
 

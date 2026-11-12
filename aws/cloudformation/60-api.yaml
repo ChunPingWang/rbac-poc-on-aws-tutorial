@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  rbac-poc-on-aws / 60 - API. Amazon API Gateway HTTP API replaces Spring Cloud Gateway:
+  Cognito JWT authorizer (north-south authN at the edge), throttling, access logs,
+  private integration to the internal ALB through a VPC Link.
+
+Parameters:
+  ProjectName: { Type: String, Default: rbac-poc }
+  CorsOrigin: { Type: String, Default: 'http://localhost:3000' }
+
+Resources:
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+      ProtocolType: HTTP
+      DisableExecuteApiEndpoint: false
+      CorsConfiguration:
+        AllowOrigins: [!Ref CorsOrigin]
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        AllowHeaders: [Authorization, Content-Type, X-Correlation-ID]
+        MaxAge: 3600
+      Tags: { Project: !Ref ProjectName }
+
+  VpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub '${ProjectName}-vpclink'
+      SubnetIds: !Split [',', !ImportValue { 'Fn::Sub': '${ProjectName}-app-subnets' }]
+      SecurityGroupIds: [!ImportValue { 'Fn::Sub': '${ProjectName}-vpclink-sg' }]
+
+  AlbIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !ImportValue { 'Fn::Sub': '${ProjectName}-alb-listener-arn' }
+      PayloadFormatVersion: '1.0'
+      TimeoutInMillis: 15000
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref Api
+      Name: cognito-jwt
+      AuthorizerType: JWT
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Issuer: !ImportValue { 'Fn::Sub': '${ProjectName}-issuer-uri' }
+        # Cognito access tokens carry client_id (not aud); API Gateway accepts either
+        Audience:
+          - !ImportValue { 'Fn::Sub': '${ProjectName}-web-client-id' }
+          - !ImportValue { 'Fn::Sub': '${ProjectName}-test-client-id' }
+
+  # Every /api/* call must carry a valid Cognito JWT. Fine-grained RBAC stays in the services.
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: 'ANY /api/{proxy+}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub 'integrations/${AlbIntegration}'
+
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/api-gateway-access'
+      RetentionInDays: 14
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref Api
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20
+        DetailedMetricsEnabled: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt AccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "time":"$context.requestTime","method":"$context.httpMethod","path":"$context.path",
+          "status":"$context.status","latency":"$context.responseLatency",
+          "integrationStatus":"$context.integrationStatus",
+          "user":"$context.authorizer.claims.username",
+          "authError":"$context.authorizer.error"}
+
+Outputs:
+  ApiEndpoint:
+    Value: !GetAtt Api.ApiEndpoint
+    Export: { Name: !Sub '${ProjectName}-api-endpoint' }
+  ApiId: { Value: !Ref Api }

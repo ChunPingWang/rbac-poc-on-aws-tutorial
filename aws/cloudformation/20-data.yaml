@@ -1,0 +1,77 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  rbac-poc-on-aws / 20 - Data. Amazon RDS for PostgreSQL (replaces PostgreSQL/H2).
+  Master password is generated and rotated by RDS in AWS Secrets Manager
+  (ManageMasterUserPassword) - no password ever appears in templates or scripts.
+  Encrypted at rest, TLS enforced (rds.force_ssl), private data subnets only.
+
+Parameters:
+  ProjectName: { Type: String, Default: rbac-poc }
+  DbInstanceClass: { Type: String, Default: db.t4g.micro }
+  DbEngineVersion: { Type: String, Default: '16' }
+  MultiAz:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  DbName: { Type: String, Default: rbacpoc }
+  DbMasterUsername: { Type: String, Default: rbacadmin }
+
+Resources:
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: rbac-poc private data subnets
+      SubnetIds: !Split [',', !ImportValue { 'Fn::Sub': '${ProjectName}-data-subnets' }]
+
+  DbParams:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: rbac-poc postgres params (TLS enforced, statement logging for audit)
+      Family: !Sub 'postgres${DbEngineVersion}'
+      Parameters:
+        rds.force_ssl: '1'
+        log_connections: '1'
+        log_disconnections: '1'
+
+  Db:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete            # POC: easy cleanup. Production: Snapshot / Retain
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-postgres'
+      Engine: postgres
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: '20'
+      MaxAllocatedStorage: 50
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: !Ref DbName
+      MasterUsername: !Ref DbMasterUsername
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      DBParameterGroupName: !Ref DbParams
+      VPCSecurityGroups: [!ImportValue { 'Fn::Sub': '${ProjectName}-db-sg' }]
+      PubliclyAccessible: false
+      MultiAZ: !Ref MultiAz
+      BackupRetentionPeriod: 1
+      CopyTagsToSnapshot: true
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: true
+      EnableCloudwatchLogsExports: [postgresql]
+      Tags: [{ Key: Project, Value: !Ref ProjectName }]
+
+Outputs:
+  DbEndpoint:
+    Value: !GetAtt Db.Endpoint.Address
+    Export: { Name: !Sub '${ProjectName}-db-endpoint' }
+  DbPort:
+    Value: !GetAtt Db.Endpoint.Port
+    Export: { Name: !Sub '${ProjectName}-db-port' }
+  DbName:
+    Value: !Ref DbName
+    Export: { Name: !Sub '${ProjectName}-db-name' }
+  DbSecretArn:
+    Description: Secrets Manager secret managed by RDS (keys - username, password)
+    Value: !GetAtt Db.MasterUserSecret.SecretArn
+    Export: { Name: !Sub '${ProjectName}-db-secret-arn' }

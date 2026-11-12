@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  rbac-poc-on-aws / 30 - Identity. Amazon Cognito User Pool replaces Keycloak + OpenLDAP.
+  Realm roles -> User Pool Groups, LDAP attribute tenant -> custom:tenant_id (read-only for users),
+  protocol mapper -> Pre Token Generation Lambda (V2_0, Essentials tier).
+
+Parameters:
+  ProjectName: { Type: String, Default: rbac-poc }
+  CallbackUrl:
+    Type: String
+    Default: http://localhost:3000/callback
+    Description: OAuth2 redirect URI for the SPA / Postman (Authorization Code + PKCE)
+
+Resources:
+  # ---------------- Pre Token Generation Lambda ----------------
+  PreTokenLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-pre-token-generation'
+      RetentionInDays: 14
+
+  PreTokenRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-pretoken-lambda-role'
+      PermissionsBoundary: !ImportValue { 'Fn::Sub': '${ProjectName}-workload-boundary-arn' }
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-own-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt PreTokenLogGroup.Arn
+
+  PreTokenFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-pre-token-generation'
+      Description: Inject tenant_id / profile claims into Cognito access tokens
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 5
+      Role: !GetAtt PreTokenRole.Arn
+      LoggingConfig: { LogGroup: !Ref PreTokenLogGroup, LogFormat: JSON }
+      Code:
+        ZipFile: |
+          // =====================================================================
+          // Cognito Pre Token Generation trigger (event version V2_0)
+          //
+          // Keycloak protocol mappers → Cognito: Cognito access tokens do NOT carry
+          // custom attributes by default. This trigger copies the user's
+          // custom:tenant_id (plus profile claims used by user-service) into the
+          // ACCESS token so the Spring Boot resource servers keep working unchanged:
+          //   tenant_id, email, given_name, family_name
+          // Groups are already present as "cognito:groups".
+          // (The same code is embedded inline in 30-identity.yaml.)
+          // =====================================================================
+          exports.handler = async (event) => {
+            const attrs = event.request?.userAttributes ?? {};
+            const access = {};
+            const id = {};
+
+            if (attrs['custom:tenant_id']) {
+              access.tenant_id = attrs['custom:tenant_id'];
+              id.tenant_id = attrs['custom:tenant_id'];
+            }
+            for (const k of ['email', 'given_name', 'family_name']) {
+              if (attrs[k]) access[k] = attrs[k];
+            }
+
+            event.response = {
+              claimsAndScopeOverrideDetails: {
+                accessTokenGeneration: { claimsToAddOrOverride: access },
+                idTokenGeneration: { claimsToAddOrOverride: id },
+              },
+            };
+            return event;
+          };
+
+  # ---------------- User Pool ----------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-users'
+      UserPoolTier: ESSENTIALS
+      DeletionProtection: INACTIVE          # POC cleanup. Production: ACTIVE
+      UsernameConfiguration: { CaseSensitive: false }
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: true }   # no self sign-up (B2B tenants)
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 3
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{ Name: verified_email, Priority: 1 }]
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: tenant_id
+          AttributeDataType: String
+          Mutable: true
+          StringAttributeConstraints: { MinLength: '1', MaxLength: '64' }
+      LambdaConfig:
+        PreTokenGenerationConfig:
+          LambdaArn: !GetAtt PreTokenFn.Arn
+          LambdaVersion: V2_0
+      UserPoolTags:
+        Project: !Ref ProjectName
+
+  PreTokenInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PreTokenFn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !GetAtt UserPool.Arn
+
+  # ---------------- Groups = RBAC roles ----------------
+  GroupAdmin:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: ADMIN, Precedence: 1, Description: 系統管理員 - 所有租戶 CRUD }
+  GroupTenantAdmin:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: TENANT_ADMIN, Precedence: 2, Description: 租戶管理員 - 本租戶新增/修改 }
+  GroupAuditor:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: AUDITOR, Precedence: 3, Description: 稽核員 - 查詢稽核日誌 }
+  GroupUser:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: USER, Precedence: 4, Description: 一般使用者 - 查詢 }
+  GroupViewer:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: VIEWER, Precedence: 5, Description: 唯讀使用者 - 查詢 }
+
+  # ---------------- App clients ----------------
+  # Public client for browser / mobile: SRP + Authorization Code with PKCE, no secret.
+  WebClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${ProjectName}-web'
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 12
+      TokenValidityUnits: { AccessToken: minutes, IdToken: minutes, RefreshToken: hours }
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      CallbackURLs: [!Ref CallbackUrl]
+      LogoutURLs: [!Ref CallbackUrl]
+      SupportedIdentityProviders: [COGNITO]
+      ReadAttributes: [email, email_verified, given_name, family_name, 'custom:tenant_id']
+      WriteAttributes: [given_name, family_name]     # users can NOT change their own tenant
+  # Confidential-style server-side client used ONLY by the verification scripts
+  # (AdminInitiateAuth requires IAM credentials -> no public password flow exposed).
+  TestHarnessClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${ProjectName}-test-harness'
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_ADMIN_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 15
+      IdTokenValidity: 15
+      RefreshTokenValidity: 1
+      TokenValidityUnits: { AccessToken: minutes, IdToken: minutes, RefreshToken: hours }
+      ReadAttributes: [email, given_name, family_name, 'custom:tenant_id']
+      WriteAttributes: [given_name, family_name]
+
+  Domain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub '${ProjectName}-${AWS::AccountId}'
+
+Outputs:
+  UserPoolId: { Value: !Ref UserPool, Export: { Name: !Sub '${ProjectName}-user-pool-id' } }
+  UserPoolArn: { Value: !GetAtt UserPool.Arn, Export: { Name: !Sub '${ProjectName}-user-pool-arn' } }
+  IssuerUri:
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+    Export: { Name: !Sub '${ProjectName}-issuer-uri' }
+  WebClientId: { Value: !Ref WebClient, Export: { Name: !Sub '${ProjectName}-web-client-id' } }
+  TestHarnessClientId: { Value: !Ref TestHarnessClient, Export: { Name: !Sub '${ProjectName}-test-client-id' } }
+  HostedUiDomain:
+    Value: !Sub 'https://${ProjectName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com'

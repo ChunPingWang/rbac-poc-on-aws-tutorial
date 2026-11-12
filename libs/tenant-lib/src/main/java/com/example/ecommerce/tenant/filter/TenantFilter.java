@@ -74,8 +74,15 @@ public class TenantFilter implements Filter {
 
         // 從 realm_roles claim 中檢查（自訂 mapper）
         List<String> realmRoles = jwt.getClaimAsStringList("realm_roles");
-        if (realmRoles != null) {
-            return realmRoles.stream().anyMatch(r ->
+        if (realmRoles != null && realmRoles.stream().anyMatch(r ->
+                r.equalsIgnoreCase(role) || r.equalsIgnoreCase("ROLE_" + role))) {
+            return true;
+        }
+
+        // 從 cognito:groups claim 中檢查（Amazon Cognito User Pool Groups）
+        List<String> cognitoGroups = jwt.getClaimAsStringList("cognito:groups");
+        if (cognitoGroups != null) {
+            return cognitoGroups.stream().anyMatch(r ->
                 r.equalsIgnoreCase(role) || r.equalsIgnoreCase("ROLE_" + role)
             );
         }

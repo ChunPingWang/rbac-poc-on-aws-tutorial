@@ -1,0 +1,358 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  rbac-poc-on-aws / 00 - IAM bootstrap (deploy ONCE by an account administrator).
+  Creates: (1) permissions boundary for every workload role, (2) CloudFormation
+  execution role used for ALL later stacks, (3) deployer IAM group with
+  least-privilege policy + MFA enforcement, (4) optional deployer IAM user
+  (no password / no access key - the human sets console password + MFA),
+  (5) S3 artifact bucket for CodeBuild source.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: rbac-poc
+    AllowedPattern: '^[a-z][a-z0-9-]{2,20}$'
+  DeployerUserName:
+    Type: String
+    Default: rbac-poc-deployer
+    Description: IAM user name for the human deployer. Leave empty to skip creating the user.
+  AllowedRegion:
+    Type: String
+    Default: us-east-1
+
+Conditions:
+  CreateUser: !Not [!Equals [!Ref DeployerUserName, '']]
+
+Resources:
+  # ------------------------------------------------------------------
+  # 1. Permissions boundary - the MAX permissions any workload role
+  #    (ECS task / execution, CodeBuild, Lambda) can ever have.
+  #    The CFN execution role can ONLY create roles carrying this boundary,
+  #    which prevents privilege escalation through role creation.
+  # ------------------------------------------------------------------
+  WorkloadBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-workload-boundary'
+      Description: Permissions boundary for all rbac-poc workload roles
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Logs
+            Effect: Allow
+            Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams, logs:DescribeLogGroups]
+            Resource: '*'
+          - Sid: EcrPullPush
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:PutImage
+              - ecr-public:GetAuthorizationToken
+              - sts:GetServiceBearerToken
+            Resource: '*'
+          - Sid: ReadRdsManagedSecret
+            Effect: Allow
+            Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+            Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AllowedRegion}:${AWS::AccountId}:secret:rds!*'
+          - Sid: ReadArtifacts
+            Effect: Allow
+            Action: [s3:GetObject, s3:GetObjectVersion, s3:GetBucketLocation, s3:ListBucket, s3:PutObject]
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-artifacts-${AWS::AccountId}-${AllowedRegion}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-artifacts-${AWS::AccountId}-${AllowedRegion}/*'
+          - Sid: CodeBuildReports
+            Effect: Allow
+            Action: [codebuild:CreateReportGroup, codebuild:CreateReport, codebuild:UpdateReport, codebuild:BatchPutTestCases]
+            Resource: '*'
+          - Sid: XRayAndMetrics
+            Effect: Allow
+            Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, cloudwatch:PutMetricData]
+            Resource: '*'
+
+  # ------------------------------------------------------------------
+  # 2. CloudFormation execution role (service role).
+  #    Humans never get these broad create/delete rights directly; they can
+  #    only hand this role to CloudFormation (iam:PassRole).
+  # ------------------------------------------------------------------
+  CfnExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RbacPocCfnExecutionRole
+      Description: CloudFormation service role for rbac-poc stacks
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' }
+      Policies:
+        - PolicyName: provision-rbac-poc
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: RegionalServices
+                Effect: Allow
+                Action:
+                  - ec2:*
+                  - elasticloadbalancing:*
+                  - ecs:*
+                  - ecr:*
+                  - logs:*
+                  - rds:*
+                  - secretsmanager:*
+                  - cognito-idp:*
+                  - lambda:*
+                  - apigateway:*
+                  - codebuild:*
+                  - cloudwatch:*
+                  - servicediscovery:*
+                  - application-autoscaling:*
+                Resource: '*'
+                Condition:
+                  StringEquals: { 'aws:RequestedRegion': !Ref AllowedRegion }
+              - Sid: KmsViaManagedServices
+                Effect: Allow
+                Action: [kms:DescribeKey, kms:CreateGrant, kms:Decrypt, kms:Encrypt, kms:GenerateDataKey*, kms:ReEncrypt*]
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    'kms:ViaService':
+                      - !Sub 'rds.${AllowedRegion}.amazonaws.com'
+                      - !Sub 'secretsmanager.${AllowedRegion}.amazonaws.com'
+              - Sid: CreateWorkloadRolesOnlyWithBoundary
+                Effect: Allow
+                Action: [iam:CreateRole, iam:PutRolePolicy, iam:AttachRolePolicy, iam:DetachRolePolicy, iam:DeleteRolePolicy, iam:PutRolePermissionsBoundary]
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-*'
+                Condition:
+                  StringEquals: { 'iam:PermissionsBoundary': !Ref WorkloadBoundary }
+              - Sid: ManageWorkloadRoles
+                Effect: Allow
+                Action: [iam:GetRole, iam:GetRolePolicy, iam:ListRolePolicies, iam:ListAttachedRolePolicies, iam:DeleteRole, iam:TagRole, iam:UntagRole, iam:UpdateRole, iam:UpdateAssumeRolePolicy, iam:ListRoleTags]
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-*'
+              - Sid: PassWorkloadRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-*'
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    'iam:AWSServiceName':
+                      - ecs.amazonaws.com
+                      - elasticloadbalancing.amazonaws.com
+                      - rds.amazonaws.com
+                      - ops.apigateway.amazonaws.com
+              - Sid: ArtifactBucketNotifications
+                Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !Sub '${ArtifactBucket.Arn}'
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Sid: ReadOnlyHelpers
+                Effect: Allow
+                Action: [iam:GetPolicy, iam:GetPolicyVersion, iam:ListPolicies, ssm:GetParameters, ssm:GetParameter, sts:GetCallerIdentity]
+                Resource: '*'
+
+  # ------------------------------------------------------------------
+  # 3. Artifact bucket (CodeBuild source zip)
+  # ------------------------------------------------------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${ProjectName}-artifacts-${AWS::AccountId}-${AllowedRegion}'
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-sources
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 7 }
+            ExpirationInDays: 30
+      Tags: [{ Key: Project, Value: !Ref ProjectName }]
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub '${ArtifactBucket.Arn}/*']
+            Condition: { Bool: { 'aws:SecureTransport': 'false' } }
+
+  # ------------------------------------------------------------------
+  # 4. Deployer group: what the human deployer may do.
+  # ------------------------------------------------------------------
+  DeployerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: RbacPocDeployerPolicy
+      Description: Least-privilege policy for the rbac-poc human deployer
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFormationOnProjectStacks
+            Effect: Allow
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:UpdateStack
+              - cloudformation:DeleteStack
+              - cloudformation:CreateChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:DescribeStackResources
+              - cloudformation:GetTemplate
+              - cloudformation:ListStackResources
+            Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AllowedRegion}:${AWS::AccountId}:stack/${ProjectName}-*/*'
+          - Sid: CloudFormationGlobalRead
+            Effect: Allow
+            Action: [cloudformation:ValidateTemplate, cloudformation:GetTemplateSummary, cloudformation:ListStacks, cloudformation:ListExports, cloudformation:DescribeStacks]
+            Resource: '*'
+          - Sid: PassOnlyTheCfnExecutionRole
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt CfnExecutionRole.Arn
+            Condition:
+              StringEquals: { 'iam:PassedToService': cloudformation.amazonaws.com }
+          - Sid: UploadSource
+            Effect: Allow
+            Action: [s3:PutObject, s3:GetObject, s3:ListBucket, s3:DeleteObject, s3:DeleteObjectVersion, s3:ListBucketVersions]
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub '${ArtifactBucket.Arn}/*']
+          - Sid: RunBuilds
+            Effect: Allow
+            Action: [codebuild:StartBuild, codebuild:BatchGetBuilds, codebuild:ListBuildsForProject]
+            Resource: !Sub 'arn:${AWS::Partition}:codebuild:${AllowedRegion}:${AWS::AccountId}:project/${ProjectName}-*'
+          - Sid: RolloutServices
+            Effect: Allow
+            Action: [ecs:UpdateService]
+            Resource: !Sub 'arn:${AWS::Partition}:ecs:${AllowedRegion}:${AWS::AccountId}:service/${ProjectName}-*/*'
+          - Sid: SeedTestUsersOnTaggedPoolOnly
+            Effect: Allow
+            Action:
+              - cognito-idp:AdminCreateUser
+              - cognito-idp:AdminSetUserPassword
+              - cognito-idp:AdminAddUserToGroup
+              - cognito-idp:AdminUpdateUserAttributes
+              - cognito-idp:AdminGetUser
+              - cognito-idp:AdminInitiateAuth
+              - cognito-idp:AdminDeleteUser
+              - cognito-idp:ListUsers
+              - cognito-idp:ListGroups
+              - cognito-idp:DescribeUserPool
+              - cognito-idp:DescribeUserPoolClient
+            Resource: !Sub 'arn:${AWS::Partition}:cognito-idp:${AllowedRegion}:${AWS::AccountId}:userpool/*'
+            Condition:
+              StringEquals: { 'aws:ResourceTag/Project': !Ref ProjectName }
+          - Sid: ReadProjectLogs
+            Effect: Allow
+            Action: [logs:FilterLogEvents, logs:GetLogEvents, logs:StartLiveTail, logs:StartQuery, logs:GetQueryResults, logs:StopQuery]
+            Resource: '*'
+          - Sid: DenyOutsideRegion
+            Effect: Deny
+            NotAction: [iam:*, sts:*, cloudshell:*, s3:ListAllMyBuckets, cloudfront:*, health:*, support:*, budgets:*, ce:*]
+            Resource: '*'
+            Condition:
+              StringNotEquals: { 'aws:RequestedRegion': !Ref AllowedRegion }
+
+  # Classic "force MFA" pattern: without MFA the user can only set up MFA / change password.
+  ForceMfaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: RbacPocForceMfaPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManageOwnMfaAndPassword
+            Effect: Allow
+            Action:
+              - iam:CreateVirtualMFADevice
+              - iam:EnableMFADevice
+              - iam:ResyncMFADevice
+              - iam:ListMFADevices
+              - iam:GetUser
+              - iam:ChangePassword
+              - iam:GetLoginProfile
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:mfa/*'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/${!aws:username}'
+          - Sid: GetAccountPasswordPolicy
+            Effect: Allow
+            Action: [iam:GetAccountPasswordPolicy, iam:ListVirtualMFADevices]
+            Resource: '*'
+          - Sid: DenyAllExceptListedIfNoMFA
+            Effect: Deny
+            NotAction:
+              - iam:CreateVirtualMFADevice
+              - iam:EnableMFADevice
+              - iam:GetUser
+              - iam:ListMFADevices
+              - iam:ListVirtualMFADevices
+              - iam:ResyncMFADevice
+              - iam:ChangePassword
+              - iam:GetAccountPasswordPolicy
+              - iam:GetLoginProfile
+              - sts:GetSessionToken
+            Resource: '*'
+            Condition:
+              BoolIfExists: { 'aws:MultiFactorAuthPresent': 'false' }
+
+  DeployerGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: RbacPocDeployers
+      ManagedPolicyArns:
+        - !Ref DeployerPolicy
+        - !Ref ForceMfaPolicy
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/job-function/ViewOnlyAccess'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSCloudShellFullAccess'
+
+  DeployerUser:
+    Type: AWS::IAM::User
+    Condition: CreateUser
+    Properties:
+      UserName: !Ref DeployerUserName
+      Groups: [!Ref DeployerGroup]
+      Tags: [{ Key: Project, Value: !Ref ProjectName }]
+
+Outputs:
+  CfnExecutionRoleArn:
+    Value: !GetAtt CfnExecutionRole.Arn
+    Export: { Name: !Sub '${ProjectName}-cfn-exec-role-arn' }
+  WorkloadBoundaryArn:
+    Value: !Ref WorkloadBoundary
+    Export: { Name: !Sub '${ProjectName}-workload-boundary-arn' }
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+    Export: { Name: !Sub '${ProjectName}-artifact-bucket' }
+  DeployerGroupName:
+    Value: !Ref DeployerGroup
+  ConsoleSignInUrl:
+    Value: !Sub 'https://${AWS::AccountId}.signin.aws.amazon.com/console'

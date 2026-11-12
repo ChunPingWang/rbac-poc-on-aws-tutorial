@@ -1,0 +1,53 @@
+# =====================================================================
+# CodeBuild: test → bootJar → docker build → push to ECR (immutable tag)
+# Source: s3://<artifact-bucket>/source/rbac-poc-source.zip
+# =====================================================================
+version: 0.2
+
+env:
+  variables:
+    GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx2g"
+  exported-variables:
+    - IMAGE_TAG
+
+phases:
+  install:
+    runtime-versions:
+      java: corretto17
+  pre_build:
+    commands:
+      - echo "Logging in to Amazon ECR ${ECR_REGISTRY}"
+      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+      - export IMAGE_TAG="$(date -u +%Y%m%d%H%M%S)-${CODEBUILD_BUILD_NUMBER}"
+      - echo "IMAGE_TAG=${IMAGE_TAG}"
+      - chmod +x ./gradlew
+  build:
+    commands:
+      - echo "=== Unit tests (changed + affected modules) ==="
+      - ./gradlew :libs:security-lib:test :libs:tenant-lib:test :services:product-service:test :services:user-service:test --continue
+      - echo "=== Build Spring Boot jars ==="
+      - ./gradlew :services:product-service:bootJar :services:user-service:bootJar -x test
+      - echo "=== Docker build ==="
+      - docker build -f aws/docker/Dockerfile.product-service -t "${PRODUCT_REPO_URI}:${IMAGE_TAG}" .
+      - docker build -f aws/docker/Dockerfile.user-service    -t "${USER_REPO_URI}:${IMAGE_TAG}" .
+  post_build:
+    commands:
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+          docker push "${PRODUCT_REPO_URI}:${IMAGE_TAG}"
+          docker push "${USER_REPO_URI}:${IMAGE_TAG}"
+          printf '{"imageTag":"%s"}' "$IMAGE_TAG" > image-tag.json
+        else
+          echo "Build failed - images NOT pushed"
+        fi
+
+reports:
+  unit-tests:
+    files:
+      - "**/build/test-results/test/*.xml"
+    file-format: JUNITXML
+
+cache:
+  paths:
+    - /root/.gradle/caches/**/*
+    - /root/.gradle/wrapper/**/*

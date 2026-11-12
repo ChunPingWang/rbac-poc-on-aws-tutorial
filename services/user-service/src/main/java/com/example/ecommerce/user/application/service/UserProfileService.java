@@ -41,6 +41,10 @@ public class UserProfileService {
 
             // Extract groups from JWT
             List<String> jwtGroups = jwt.getClaimAsStringList("groups");
+            if (jwtGroups == null) {
+                // Amazon Cognito: User Pool Groups 位於 cognito:groups
+                jwtGroups = jwt.getClaimAsStringList("cognito:groups");
+            }
             if (jwtGroups != null) {
                 groups = jwtGroups;
             }

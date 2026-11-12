@@ -49,6 +49,7 @@ class ProductQueryServiceTest {
         void shouldReturnProductWhenFound() {
             UUID id = UUID.randomUUID();
             Product product = createActiveProduct("P000001", "Test Product", "tenant-1");
+            tenantContextMock.when(TenantContext::getCurrentTenant).thenReturn("tenant-1");
 
             when(productRepository.findById(ProductId.of(id))).thenReturn(Optional.of(product));
 
@@ -58,6 +59,40 @@ class ProductQueryServiceTest {
             assertNotNull(result);
             assertEquals("Test Product", result.name());
             assertEquals("P000001", result.productCode());
+        }
+
+        @Test
+        @DisplayName("should hide product of another tenant (404, no existence leak)")
+        void shouldHideProductOfAnotherTenant() {
+            UUID id = UUID.randomUUID();
+            Product product = createActiveProduct("P000002", "Tenant A Secret", "tenant-a");
+            tenantContextMock.when(TenantContext::getCurrentTenant).thenReturn("tenant-b");
+            when(productRepository.findById(ProductId.of(id))).thenReturn(Optional.of(product));
+
+            assertThrows(ResourceNotFoundException.class,
+                () -> queryService.handle(new GetProductByIdQuery(id)));
+        }
+
+        @Test
+        @DisplayName("system admin can read product of any tenant")
+        void systemAdminCanReadAnyTenant() {
+            UUID id = UUID.randomUUID();
+            Product product = createActiveProduct("P000003", "Tenant A Item", "tenant-a");
+            tenantContextMock.when(TenantContext::getCurrentTenant).thenReturn("system");
+            when(productRepository.findById(ProductId.of(id))).thenReturn(Optional.of(product));
+
+            assertEquals("Tenant A Item", queryService.handle(new GetProductByIdQuery(id)).name());
+        }
+
+        @Test
+        @DisplayName("should fail closed when tenant context is missing")
+        void shouldFailClosedWithoutTenant() {
+            UUID id = UUID.randomUUID();
+            Product product = createActiveProduct("P000004", "Item", "tenant-a");
+            when(productRepository.findById(ProductId.of(id))).thenReturn(Optional.of(product));
+
+            assertThrows(ResourceNotFoundException.class,
+                () -> queryService.handle(new GetProductByIdQuery(id)));
         }
 
         @Test
