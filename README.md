@@ -594,7 +594,7 @@ CodeBuild 依序執行：`security-lib` / `tenant-lib` / `product-service` / `us
 | 10-7 | Step 5 ECS | 失敗後 stack 進入 ROLLBACK_COMPLETE | ECS Deployment Circuit Breaker 在 3 個 task 失敗後判定部署失敗，CloudFormation 回滾（**這正是預期的保護機制**） | `delete-stack` 後重新部署 |
 | 10-8 | 重新部署前 | `aws cloudformation wait stack-rollback-complete` 一直等不到 | 該 waiter 只認 `UPDATE_ROLLBACK_COMPLETE`；**建立失敗**的回滾狀態是 `ROLLBACK_COMPLETE` | 直接 `describe-stacks` 檢查狀態後 `delete-stack` |
 | 10-9 | Step 5 ECS | init container 成功（`tmp-ready`）後，app 啟動失敗：`Unable to determine source type <S> and target type <T> for your Converter` | **本次改造引入的錯誤**：把 JWT converter 寫成 lambda `@Bean`；Spring MVC 會把所有 `Converter` bean 註冊進 conversion service，lambda 的泛型無法解析。slice 測試不載入 SecurityConfig，所以單元測試沒抓到 | 改為具名類別 `PrincipalAwareJwtAuthenticationConverter`，並新增「可註冊進 conversion service」的回歸測試 |
-| 10-10 | Step 5 ECS | user-service log：`syntax error at or near "user"`（`alter table if exists user.audit_logs ...`） | schema-per-service 把 user-service 的 schema 取名為 `user`，**`user` 是 PostgreSQL 保留字**，Hibernate 產生的 DDL / SQL 沒有加引號 | schema 改名為 `user_service` |
+| 10-10 | Step 5 ECS | user-service log：`syntax error at or near "user"`（`alter table if exists user.audit_logs ...`） | schema-per-service 把 user-service 的 schema 取名為 `user`，**`user` 是 PostgreSQL 保留字**，Hibernate 產生的 DDL / SQL 沒有加引號 | schema 改名為 `user_service`。連帶影響：`audit-lib` 的 `AuditHealthIndicator` 查詢 `user.audit_logs` 失敗 → `/actuator/health` 回 DOWN(503) → ALB 判定 unhealthy → Circuit Breaker 回滾 |
 <!-- TROUBLE-EXTRA -->
 
 **通用除錯指令**

@@ -19,3 +19,5 @@
 | 12:13 | deployer | 第二次部署 services | init container `tmp-ready` 成功；app 啟動失敗 `Unable to determine source type <S> and target type <T> for your Converter`（本次改造的 lambda @Bean 造成）→ 改具名類別 + 回歸測試，重新 CodeBuild | 17 |
 | 12:15 | deployer | CodeBuild #4 | 成功，`TEST SUMMARY: tests=144 failures=0 errors=0 skipped=0`，image tag `20261112121507-4` | |
 | 12:27 | deployer | 第三次部署 services（新 image） | 兩個服務皆啟動；user-service log 出現 `syntax error at or near "user"`：schema 名 `user` 為 PostgreSQL 保留字 → 改為 `user_service`，重新建置 | 18 |
+| 12:55 | deployer | services / api 部署完成、seed 6 位使用者 | API endpoint `https://1v70386w88.execute-api.us-east-1.amazonaws.com` | 19, 20 |
+| 12:56 | deployer | `50-verify.sh` 第一次 | 11 pass / 42 fail：**驗證腳本本身的 bug**（`local m=... args=(... "$m")` 同一行宣告時 `$m` 尚未賦值 → curl `-X` 空白）；另 deployer 無 `ecr:DescribeImageScanFindings` | |

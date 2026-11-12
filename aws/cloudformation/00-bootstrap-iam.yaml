@@ -258,6 +258,14 @@ Resources:
             Effect: Allow
             Action: [codebuild:StartBuild, codebuild:BatchGetBuilds, codebuild:ListBuildsForProject]
             Resource: !Sub 'arn:${AWS::Partition}:codebuild:${AllowedRegion}:${AWS::AccountId}:project/${ProjectName}-*'
+          - Sid: ReadProjectImagesAndScanFindings
+            Effect: Allow
+            Action: [ecr:DescribeImages, ecr:DescribeImageScanFindings, ecr:ListImages]
+            Resource: !Sub 'arn:${AWS::Partition}:ecr:${AllowedRegion}:${AWS::AccountId}:repository/${ProjectName}/*'
+          - Sid: ReadBuildTestReports
+            Effect: Allow
+            Action: [codebuild:BatchGetReports, codebuild:DescribeTestCases, codebuild:ListReportsForReportGroup]
+            Resource: !Sub 'arn:${AWS::Partition}:codebuild:${AllowedRegion}:${AWS::AccountId}:report-group/${ProjectName}-*'
           - Sid: RolloutServices
             Effect: Allow
             Action: [ecs:UpdateService]

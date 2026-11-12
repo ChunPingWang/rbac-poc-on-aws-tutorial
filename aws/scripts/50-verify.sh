@@ -44,7 +44,8 @@ token() {  # token <username> <password>
 claims() { python3 -c 'import sys,base64,json;p=sys.argv[1].split(".")[1];p+="="*(-len(p)%4);print(json.dumps(json.loads(base64.urlsafe_b64decode(p))))' "$1"; }
 # call <METHOD> <PATH> <TOKEN|-> [JSON]  -> prints HTTP status, body in $TMP/body
 call() {
-  local m="$1" p="$2" t="$3" d="$4" args=(-s -o "$TMP/body" -w '%{http_code}' -X "$m" "$API$p")
+  local m="$1" p="$2" t="$3" d="$4"
+  local args=(-s -o "$TMP/body" -w '%{http_code}' -X "$m" "$API$p")
   [[ "$t" != "-" ]] && args+=(-H "Authorization: Bearer $t")
   [[ -n "$d" ]] && args+=(-H 'Content-Type: application/json' -d "$d")
   curl "${args[@]}"
@@ -163,10 +164,15 @@ TASK="$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$PROJECT-product
 ENI_PUB="$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK" --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text \
           | xargs -I{} aws ec2 describe-network-interfaces --network-interface-ids {} --query 'NetworkInterfaces[0].Association.PublicIp' --output text 2>/dev/null || echo error)"
 check "ECS task has no public IP"     None "${ENI_PUB:-None}"
-TAG="$(aws ecs describe-task-definition --task-definition "$PROJECT-product-service" --query 'taskDefinition.containerDefinitions[0].image' --output text | awk -F: '{print $NF}')"
+TAG="$(aws ecs describe-task-definition --task-definition "$PROJECT-product-service" --query "taskDefinition.containerDefinitions[?name=='product-service'].image | [0]" --output text | awk -F: '{print $NF}')"
 CRIT="$(aws ecr describe-image-scan-findings --repository-name "$PROJECT/product-service" --image-id imageTag="$TAG" \
         --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text 2>/dev/null || echo error)"
-check "ECR scan: CRITICAL findings (product image)" None "${CRIT:-None}"
+if [[ "$CRIT" == "error" ]]; then
+  N=$((N+1)); echo -e "  ${C_YLW}SKIP${C_OFF} [$N] ECR scan findings (no ecr:DescribeImageScanFindings - redeploy 00-bootstrap to grant)"
+  echo "| $N | ECR scan: CRITICAL findings | None | no permission | SKIP |" >> "$REPORT"
+else
+  check "ECR scan: CRITICAL findings (product image)" None "${CRIT:-None}"
+fi
 
 # ------------------------------------------------------------------
 echo; echo "TOTAL: $PASS passed, $FAIL failed"
