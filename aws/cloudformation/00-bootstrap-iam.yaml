@@ -15,13 +15,21 @@ Parameters:
   DeployerUserName:
     Type: String
     Default: rbac-poc-deployer
-    Description: IAM user name for the human deployer. Leave empty to skip creating the user.
+    Description: IAM user name for the human deployer.
+  DeployerUserExists:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      'true' = the user was already created by hand in the IAM console -> only add it to the
+      RbacPocDeployers group. 'false' = create the user (no password / no access key).
   AllowedRegion:
     Type: String
     Default: us-east-1
 
 Conditions:
-  CreateUser: !Not [!Equals [!Ref DeployerUserName, '']]
+  CreateUser: !Equals [!Ref DeployerUserExists, 'false']
+  AttachExistingUser: !Equals [!Ref DeployerUserExists, 'true']
 
 Resources:
   # ------------------------------------------------------------------
@@ -341,6 +349,13 @@ Resources:
       UserName: !Ref DeployerUserName
       Groups: [!Ref DeployerGroup]
       Tags: [{ Key: Project, Value: !Ref ProjectName }]
+
+  ExistingDeployerMembership:
+    Type: AWS::IAM::UserToGroupAddition
+    Condition: AttachExistingUser
+    Properties:
+      GroupName: !Ref DeployerGroup
+      Users: [!Ref DeployerUserName]
 
 Outputs:
   CfnExecutionRoleArn:
