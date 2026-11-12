@@ -173,7 +173,7 @@ Resources:
       LogoutURLs: [!Ref CallbackUrl]
       SupportedIdentityProviders: [COGNITO]
       ReadAttributes: [email, email_verified, given_name, family_name, 'custom:tenant_id']
-      WriteAttributes: [given_name, family_name]     # users can NOT change their own tenant
+      WriteAttributes: [email, given_name, family_name]   # email must be writable (required attr); users can NOT change their own tenant
   # Confidential-style server-side client used ONLY by the verification scripts
   # (AdminInitiateAuth requires IAM credentials -> no public password flow exposed).
   TestHarnessClient:
@@ -190,7 +190,7 @@ Resources:
       RefreshTokenValidity: 1
       TokenValidityUnits: { AccessToken: minutes, IdToken: minutes, RefreshToken: hours }
       ReadAttributes: [email, given_name, family_name, 'custom:tenant_id']
-      WriteAttributes: [given_name, family_name]
+      WriteAttributes: [email, given_name, family_name]
 
   Domain:
     Type: AWS::Cognito::UserPoolDomain

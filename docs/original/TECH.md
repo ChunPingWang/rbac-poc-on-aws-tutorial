@@ -3087,8 +3087,8 @@ rbac-sso-poc/                        # rootProject.name
 
 - [PRD.md](./PRD.md) - 產品需求文件
 - [INFRA.md](./INFRA.md) - 基礎設施文件
-- [specs/001-shared-audit-lib](./specs/001-shared-audit-lib/) - 稽核函式庫規格
-- [specs/002-multi-tenant-ecommerce](./specs/002-multi-tenant-ecommerce/) - 多租戶電商平台規格
+- [specs/001-shared-audit-lib](../../specs/001-shared-audit-lib/) - 稽核函式庫規格
+- [specs/002-multi-tenant-ecommerce](../../specs/002-multi-tenant-ecommerce/) - 多租戶電商平台規格
 
 ---
 

@@ -24,7 +24,12 @@ phases:
   build:
     commands:
       - echo "=== Unit tests (changed + affected modules) ==="
-      - ./gradlew :libs:security-lib:test :libs:tenant-lib:test :services:product-service:test :services:user-service:test --continue
+      - |
+        ./gradlew :libs:security-lib:test :libs:tenant-lib:test :services:product-service:test :services:user-service:test --continue || {
+          echo "=== FAILED TESTS (first lines of each failure) ==="
+          grep -h -B1 -A12 "<failure" libs/*/build/test-results/test/*.xml services/*/build/test-results/test/*.xml 2>/dev/null | head -200
+          exit 1
+        }
       - echo "=== Build Spring Boot jars ==="
       - ./gradlew :services:product-service:bootJar :services:user-service:bootJar -x test
       - echo "=== Docker build ==="

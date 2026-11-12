@@ -1,1482 +1,436 @@
-# RBAC-SSO-POC
+# RBAC + SSO POC on AWS — 從開源元件遷移到 AWS 原生服務的完整實戰教學
 
-多租戶電子商務平台 POC - 基於 Hexagonal Architecture 的 RBAC + SSO 實作，整合 Keycloak LDAP 認證與稽核功能。
+> 本 repo 由 [ChunPingWang/rbac-sso-poc](https://github.com/ChunPingWang/rbac-sso-poc)（Keycloak + OpenLDAP + Spring Cloud Gateway + Kind/K8s）延伸而來，
+> 把開源元件替換為 AWS 技術棧、實際部署到 AWS 帳號、以自動化腳本驗證 RBAC / 多租戶 / 稽核行為，並在驗證後清除所有計費資源。
+> **原專案的全部程式碼、腳本、K8s / Docker 部署檔都保留**，原始文件移至 [`docs/original/`](docs/original/)。
 
-## 專案狀態
+<!-- RESULT-SUMMARY -->
 
-| 指標 | 狀態 |
-|------|------|
-| **建置狀態** | BUILD SUCCESSFUL |
-| **測試數量** | 344 tests |
-| **測試通過率** | 100% (0 failures) |
-| **product-service 覆蓋率** | 96% |
-| **user-service 覆蓋率** | 96% |
-| **gateway-service 覆蓋率** | 92% |
-| **Cucumber 場景** | 18 scenarios |
-| **Docker 整合測試** | 16/16 通過 |
-| **K8s 整合測試** | 36/36 通過 |
+---
 
 ## 目錄
 
-- [專案概述](#專案概述)
-- [分支策略](#分支策略)
-- [系統架構](#系統架構)
-- [類別圖](#類別圖)
-- [ER Diagram](#er-diagram)
-- [場景序列圖](#場景序列圖)
-- [RBAC 權限控制](#rbac-權限控制)
-- [BDD 測試案例](#bdd-測試案例)
-- [測試案例說明](#測試案例說明)
-- [Docker 整合測試](#docker-整合測試)
-- [Kubernetes 整合測試](#kubernetes-整合測試)
-- [mTLS 東西向安全](#mtls-東西向安全-spring-boot--cert-manager)
-- [Keycloak LDAP 整合教學](#keycloak-ldap-整合教學)
-- [快速開始](#快速開始)
-- [專案結構](#專案結構)
+1. [專案評估：原架構盤點與發現](#1-專案評估原架構盤點與發現)
+2. [開源元件 → AWS 服務對照與選型理由](#2-開源元件--aws-服務對照與選型理由)
+3. [目標架構](#3-目標架構)
+4. [身分、群組、角色、權限的關聯與目的](#4-身分群組角色權限的關聯與目的)
+5. [AWS 最佳實踐對照](#5-aws-最佳實踐對照)
+6. [程式碼改造說明](#6-程式碼改造說明)
+7. [基礎設施即程式碼（CloudFormation 00–60）](#7-基礎設施即程式碼cloudformation-0060)
+8. [Step-by-Step 部署（含截圖）](#8-step-by-step-部署含截圖)
+9. [驗證結果](#9-驗證結果)
+10. [疑難排解（實際踩到的坑）](#10-疑難排解實際踩到的坑)
+11. [成本估算](#11-成本估算)
+12. [清除所有計費資源](#12-清除所有計費資源)
+13. [走向 Production 的強化建議](#13-走向-production-的強化建議)
+14. [Repo 結構](#14-repo-結構)
 
 ---
 
-## 專案概述
+## 1. 專案評估：原架構盤點與發現
 
-本專案實作多租戶電子商務平台的核心功能，展示以下技術概念：
+### 1.1 原專案組成
 
-### 核心特性
+| 層 | 原元件 | 說明 |
+|---|---|---|
+| 身分來源 | OpenLDAP (`osixia/openldap`) | 使用者、群組目錄 |
+| SSO / IdP | Keycloak 24 + PostgreSQL | LDAP User Federation、Realm Roles、OIDC Token |
+| API Gateway | Spring Cloud Gateway (`gateway-service`) | 路由 `/api/products/**`、`/api/users/**`，JWT 驗證 |
+| 微服務 | `product-service`（Hexagonal + DDD + CQRS）、`user-service` | Spring Boot 3.3 / Java 17 |
+| 共用函式庫 | `security-lib`、`tenant-lib`、`audit-lib`、`common-lib` | JWT→角色、租戶 Context、AOP 稽核 |
+| 資料庫 | H2（服務）/ PostgreSQL（Keycloak） | |
+| 執行平台 | Docker Compose、Kind (K8s) | |
+| 東西向安全 | cert-manager + Spring Boot SSL Bundle（mTLS） | |
 
-| 特性 | 說明 | 狀態 |
-|------|------|:----:|
-| **多租戶架構** | 租戶資料隔離，TenantContext 管理 | Done |
-| **RBAC 權限控制** | 基於角色的存取控制，整合 Spring Security | Done |
-| **SSO 單一登入** | OAuth2/OIDC + Keycloak 整合 | Done |
-| **Hexagonal Architecture** | 六角架構，Ports & Adapters 模式 | Done |
-| **DDD 領域驅動設計** | Aggregate、Value Objects、Domain Events | Done |
-| **CQRS 模式** | 命令/查詢分離 | Done |
-| **稽核日誌** | Spring AOP / Domain Event 雙機制 | Done |
-| **BDD 測試** | Cucumber + 中文 Gherkin | Done |
-| **mTLS 東西向安全** | Spring Boot SSL + cert-manager 憑證管理 | Done |
+### 1.2 評估時發現的問題（已在本 repo 修正）
+
+| # | 問題 | 影響 | 修正 |
+|---|---|---|---|
+| F1 | **多租戶隔離只做在「列表查詢」**。`GET/PUT/DELETE /api/products/{id}` 沒有檢查租戶 | 任何租戶只要知道 ID 就能讀取、修改他租戶商品（違反原專案 `multi-tenant.feature`：「租戶無法存取其他租戶的商品 → 資源不存在」） | 新增 `TenantAccessGuard`：非 `system` 租戶存取他租戶資料一律回 **404**（不洩漏資源存在與否），取不到租戶時 fail-closed |
+| F2 | **沒有任何 `@ControllerAdvice`** | `ResourceNotFoundException` 變成 HTTP 500 | 新增 `GlobalExceptionHandler`（404 / 400 / 409），刻意不攔截 `AccessDeniedException`，讓 Spring Security 維持 401/403 |
+| F3 | `gradle-wrapper.jar` 被 `.gitignore` 的 `*.jar` 排除 | clone 後無法執行 `./gradlew` | 補回 wrapper jar 並修正 `.gitignore` |
+| F4 | 角色只從 Keycloak 專屬 claim（`realm_access`）解析 | 換 IdP 就失效 | `CompositeRoleConverter` 同時支援 Keycloak 與 Cognito（`cognito:groups`），本地 / K8s / AWS 共用同一份程式碼 |
+
+<!-- F-EXTRA -->
 
 ---
 
-## 分支策略
+## 2. 開源元件 → AWS 服務對照與選型理由
 
-| 分支 | 稽核機制 | 說明 |
-|------|----------|------|
-| `main` | **Spring AOP** | 透過 `@Auditable` 註解自動攔截 |
-| `domain-event-for-audit` | **Domain Event** | 透過領域事件發布，提供細緻控制 |
+| 原開源元件 | AWS 取代 | 選型理由 / 取捨 |
+|---|---|---|
+| OpenLDAP（使用者目錄） | **Amazon Cognito User Pool** | 全託管、免維運；`custom:tenant_id` 取代 LDAP 屬性 |
+| Keycloak Realm Roles | **Cognito User Pool Groups**（`ADMIN`/`TENANT_ADMIN`/`AUDITOR`/`USER`/`VIEWER`） | Group 名稱直接出現在 token 的 `cognito:groups` |
+| Keycloak Protocol Mapper | **Cognito Pre Token Generation Lambda（V2_0）** | 把 `tenant_id`、email、姓名注入 **access token**（Cognito 預設不放 custom 屬性） |
+| Keycloak OIDC / SSO 登入頁 | **Cognito Hosted UI + OAuth2 Authorization Code + PKCE** | 瀏覽器端 SSO；測試腳本則用伺服器端 `ADMIN_USER_PASSWORD_AUTH` |
+| Spring Cloud Gateway | **Amazon API Gateway HTTP API + JWT Authorizer** | 邊界驗證、節流、存取日誌全託管；細粒度 RBAC 仍留在服務內（縱深防禦） |
+| K8s Service / NodePort | **內部 Application Load Balancer**（Path-based routing） | 只能經由 API Gateway VPC Link 進入 |
+| Kind / K8s Deployment | **Amazon ECS on AWS Fargate** | 無伺服器容器；不選 EKS 是因 control plane 每月約 US$73 起、POC 不需要 K8s API |
+| PostgreSQL / H2 | **Amazon RDS for PostgreSQL 16** | 加密、強制 TLS、密碼由 **Secrets Manager** 託管（`ManageMasterUserPassword`） |
+| Docker build / registry | **AWS CodeBuild + Amazon ECR** | 在 AWS 內跑單元測試 → 打包 → 建 image；ECR 不可變 tag + 推送即掃描 |
+| docker logs / kubectl logs | **Amazon CloudWatch Logs**、Container Insights、VPC Flow Logs | |
+| cert-manager mTLS（東西向） | **未部署**（見 [§13](#13-走向-production-的強化建議)） | AWS Private CA 一般模式每月約 US$400；POC 以 Security Group 鏈 + 私有子網路取代，正式環境可用 VPC Lattice / Service Connect TLS |
+| Spring Cloud Gateway 的 CORS | API Gateway `CorsConfiguration` | |
 
-### Spring AOP 稽核 (main 分支)
+---
+
+## 3. 目標架構
+
+### 3.1 整體架構圖
+
+```mermaid
+flowchart TB
+    subgraph Client["Client"]
+        BROWSER["Browser / SPA<br/>(Authorization Code + PKCE)"]
+        SCRIPT["驗證腳本 50-verify.sh<br/>(CloudShell)"]
+    end
+
+    subgraph Identity["Amazon Cognito (取代 Keycloak + OpenLDAP)"]
+        UP["User Pool rbac-poc-users<br/>Groups = 角色<br/>custom:tenant_id"]
+        HUI["Hosted UI<br/>rbac-poc-&lt;acct&gt;.auth..."]
+        LAMBDA["Lambda<br/>Pre Token Generation V2<br/>注入 tenant_id"]
+        UP --> LAMBDA
+    end
+
+    subgraph Edge["Edge (取代 Spring Cloud Gateway)"]
+        APIGW["API Gateway HTTP API<br/>JWT Authorizer (Cognito)<br/>Throttling 20 rps / burst 50<br/>Access Logs"]
+    end
+
+    subgraph VPC["VPC 10.20.0.0/16 (2 AZ)"]
+        subgraph Public["Public subnets"]
+            NAT["NAT Gateway"]
+        end
+        subgraph App["Private app subnets"]
+            VPCLINK["VPC Link ENIs"]
+            ALB["Internal ALB :80<br/>/api/products* → product<br/>/api/v1/audit-logs* → product<br/>/api/users* → user"]
+            PS["ECS Fargate<br/>product-service :8081"]
+            US["ECS Fargate<br/>user-service :8082"]
+        end
+        subgraph Data["Private data subnets (無對外路由)"]
+            RDS[("RDS PostgreSQL 16<br/>schema: product / user<br/>加密 + 強制 TLS")]
+        end
+        S3EP["S3 Gateway Endpoint"]
+    end
+
+    subgraph Platform["Platform services"]
+        SM["Secrets Manager<br/>(RDS managed secret)"]
+        ECR["ECR<br/>immutable tags + scan"]
+        CB["CodeBuild<br/>test → jar → image"]
+        S3["S3 artifact bucket"]
+        CW["CloudWatch Logs<br/>Container Insights<br/>VPC Flow Logs"]
+    end
+
+    BROWSER -- "1 登入" --> HUI --> UP
+    SCRIPT -- "1 AdminInitiateAuth" --> UP
+    BROWSER -- "2 Bearer access token" --> APIGW
+    SCRIPT -- "2 Bearer access token" --> APIGW
+    APIGW -- "驗簽 / iss / client_id (JWKS)" --> UP
+    APIGW --> VPCLINK --> ALB
+    ALB --> PS
+    ALB --> US
+    PS -- "JWT 再驗證 + @PreAuthorize + Tenant" --> RDS
+    US --> RDS
+    PS & US -. "JWKS (443 via NAT)" .-> NAT
+    PS & US -. "DB 帳密 (啟動時注入)" .-> SM
+    S3 --> CB --> ECR -. "pull" .-> PS & US
+    PS & US -. logs .-> CW
+```
+
+### 3.2 一次 API 請求的完整流程
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as tenant-a.admin
+    participant C as Cognito User Pool
+    participant L as Pre Token Lambda
+    participant G as API Gateway (JWT Authorizer)
+    participant A as Internal ALB
+    participant P as product-service (Fargate)
+    participant D as RDS PostgreSQL
+
+    U->>C: 登入 (帳密 / Hosted UI)
+    C->>L: TokenGeneration_Authentication 事件
+    L-->>C: claimsToAddOrOverride: tenant_id=tenant-a
+    C-->>U: access token (cognito:groups=[TENANT_ADMIN], tenant_id, username)
+    U->>G: POST /api/products  Authorization: Bearer ...
+    G->>G: 驗簽 (JWKS)、iss、client_id、exp
+    alt token 無效
+        G-->>U: 401 Unauthorized（請求不會進到 VPC）
+    end
+    G->>A: VPC Link 私有整合
+    A->>P: path /api/products → product TG
+    P->>P: Spring Security 再驗 JWT<br/>CompositeRoleConverter → ROLE_TENANT_ADMIN<br/>TenantFilter → tenant-a
+    P->>P: @PreAuthorize hasAnyRole('ADMIN','TENANT_ADMIN')
+    P->>D: INSERT product (tenant_id='tenant-a')
+    P->>D: INSERT audit_logs (PRODUCT_CREATED, tenant-a.admin)
+    P-->>U: 201 Created
+```
+
+### 3.3 網路與 Security Group 鏈
+
+```mermaid
+flowchart LR
+    INTERNET((Internet)) -->|HTTPS 443| APIGW[API Gateway<br/>AWS 託管]
+    APIGW -->|VPC Link| SGL[sg: vpclink<br/>egress 80 → VPC]
+    SGL -->|80| SGA[sg: alb<br/>ingress 80 只允許 vpclink]
+    SGA -->|8081-8082| SGP[sg: app<br/>ingress 只允許 alb<br/>egress 443 + 5432]
+    SGP -->|5432| SGD[sg: db<br/>ingress 只允許 app<br/>egress 無]
+    SGP -->|443 via NAT| AWSAPI[Cognito JWKS / ECR / Logs / Secrets]
+```
+
+| 子網路 | CIDR | 路由 | 放什麼 |
+|---|---|---|---|
+| public-a / b | 10.20.0.0/24、10.20.1.0/24 | 0.0.0.0/0 → IGW | 只有 NAT Gateway |
+| app-a / b | 10.20.4.0/24、10.20.5.0/24 | 0.0.0.0/0 → NAT、S3 Gateway Endpoint | VPC Link ENI、內部 ALB、Fargate tasks（**無 public IP**） |
+| data-a / b | 10.20.8.0/24、10.20.9.0/24 | **只有 local** | RDS |
+
+---
+
+## 4. 身分、群組、角色、權限的關聯與目的
+
+本 POC 有 **兩個完全分離的身分平面**，教學時最容易混淆，務必分清楚：
+
+| 平面 | 管什麼 | 身分來源 | 授權機制 |
+|---|---|---|---|
+| **A. AWS 管理平面** | 誰能「建置／部署／維運」AWS 資源 | AWS IAM | IAM Policy、Permissions Boundary、Service Role |
+| **B. 應用程式平面** | 誰能「呼叫業務 API」（商品、使用者、稽核） | Amazon Cognito | JWT（`cognito:groups`、`tenant_id`）→ Spring Security `@PreAuthorize` + TenantFilter |
+
+### 4.1 AWS 管理平面（IAM）
+
+```mermaid
+flowchart TB
+    ROOT["👤 root<br/>只用於帳號層級任務<br/>MFA ✔ / 不留 access key"]
+    ADMIN["👤 IAM User: poc-admin<br/>Policy: AdministratorAccess<br/>(建議 MFA)"]
+    DEP["👤 IAM User: rbac-poc-deployer<br/>(MFA 必須)"]
+    GRP["👥 IAM Group: RbacPocDeployers"]
+    P1["📜 RbacPocDeployerPolicy<br/>只能操作 rbac-poc-* stack<br/>只能 PassRole 給 CFN 執行角色<br/>上傳 artifact / 啟動 CodeBuild<br/>在 Project=rbac-poc 的 User Pool 建測試帳號<br/>鎖 us-east-1"]
+    P2["📜 RbacPocForceMfaPolicy<br/>無 MFA → 只能設定 MFA"]
+    P3["📜 ViewOnlyAccess (AWS 管理)"]
+    P4["📜 AWSCloudShellFullAccess (AWS 管理)"]
+    CFNROLE["🎭 Role: RbacPocCfnExecutionRole<br/>信任: cloudformation.amazonaws.com<br/>可建立本 POC 所需服務 (鎖 us-east-1)<br/>只能建立 rbac-poc-* 角色且必須掛 Boundary"]
+    BOUND["🛡️ Permissions Boundary<br/>rbac-poc-workload-boundary<br/>workload 角色的「權限天花板」"]
+    subgraph WL["Workload 服務角色（由 CloudFormation 建立，全部掛 Boundary）"]
+        R1["🎭 rbac-poc-ecs-execution-role<br/>拉 ECR image、寫 log、讀 DB secret"]
+        R2["🎭 rbac-poc-ecs-task-role<br/>應用程式本身：無任何 AWS 權限"]
+        R3["🎭 rbac-poc-codebuild-role<br/>讀 artifact、推 ECR、寫 log"]
+        R4["🎭 rbac-poc-pretoken-lambda-role<br/>只寫自己的 log"]
+        R5["🎭 rbac-poc-vpc-flowlogs-role<br/>寫 flow log"]
+    end
+
+    ROOT -. "一次性：建立 poc-admin、密碼政策" .-> ADMIN
+    ADMIN -- "一次性：部署 00-bootstrap-iam" --> GRP & CFNROLE & BOUND
+    DEP -- "member of" --> GRP
+    GRP --> P1 & P2 & P3 & P4
+    DEP -- "iam:PassRole (僅此角色)" --> CFNROLE
+    CFNROLE -- "建立 (需掛 Boundary)" --> WL
+    BOUND -. "限制上限" .-> WL
+```
+
+| 身分 / 物件 | 類型 | 目的 | 為什麼這樣設計（最佳實踐） |
+|---|---|---|---|
+| root | 帳號根使用者 | 只做「必須用 root」的事 | AWS 建議 root 不做日常操作；開 MFA、刪除 access key |
+| `poc-admin` | IAM User + `AdministratorAccess` | 一次性部署 IAM bootstrap（建角色、政策、群組） | 讓建立 IAM 這種高權限動作與日常部署分離 |
+| `rbac-poc-deployer` | IAM User（無 access key，只用 Console + CloudShell） | 日常部署、驗證、清除 | **最小權限**：本身不能直接建 VPC/RDS/ECS，只能透過 CloudFormation 執行角色 |
+| `RbacPocDeployers` | IAM Group | 權限掛在群組而非個人 | 人員異動只要調整群組成員 |
+| `RbacPocDeployerPolicy` | Customer managed policy | 限制 stack 名稱、PassRole 對象、Region、Cognito pool tag | 避免部署者動到其他專案資源 |
+| `RbacPocForceMfaPolicy` | Customer managed policy | 沒有 MFA 時拒絕所有動作 | 強制 MFA |
+| `RbacPocCfnExecutionRole` | Service role（CloudFormation） | 實際建立所有資源 | **職責分離**：人只有「交給 CFN」的權限；所有變更都有 stack 紀錄可追蹤、可回滾 |
+| `rbac-poc-workload-boundary` | Permissions Boundary | 所有 workload 角色的權限上限 | 防止「透過建立高權限角色提權」：CFN 執行角色若建立不掛 Boundary 的角色會被 IAM 拒絕 |
+| ECS execution role | Service role | ECS agent 拉 image、寫 log、取 DB secret | 與 task role 分離 |
+| ECS task role | Service role | 應用程式本身的 AWS 權限 | 本應用不呼叫 AWS API → **零權限** |
+| CodeBuild role | Service role | 讀 S3 原始碼、推 ECR | 只能推到兩個 repo |
+| Pre-token Lambda role | Service role | 只寫自己的 log group | |
+
+### 4.2 應用程式平面（Cognito → RBAC → 多租戶）
+
+```mermaid
+flowchart LR
+    subgraph Users["Cognito Users（取代 LDAP 使用者）"]
+        U1["admin.user<br/>tenant: -"]
+        U2["tenant-a.admin<br/>tenant: tenant-a"]
+        U3["tenant-b.admin<br/>tenant: tenant-b"]
+        U4["normal.user<br/>tenant: tenant-a"]
+        U5["viewer.user<br/>tenant: tenant-a"]
+        U6["auditor.user<br/>tenant: -"]
+    end
+    subgraph Groups["Cognito Groups = Realm Roles"]
+        G1["ADMIN"]
+        G2["TENANT_ADMIN"]
+        G3["USER"]
+        G4["VIEWER"]
+        G5["AUDITOR"]
+    end
+    subgraph Authorities["Spring Security Authorities"]
+        A1["ROLE_ADMIN"]
+        A2["ROLE_TENANT_ADMIN"]
+        A3["ROLE_USER"]
+        A4["ROLE_VIEWER"]
+        A5["ROLE_AUDITOR"]
+    end
+    U1 --> G1 --> A1
+    U2 --> G2 --> A2
+    U3 --> G2
+    U4 --> G3 --> A3
+    U5 --> G4 --> A4
+    U6 --> G5 --> A5
+```
+
+**Token → 權限的轉換鏈**
+
+| 步驟 | 元件 | 輸入 | 輸出 |
+|---|---|---|---|
+| 1 | Cognito | 使用者所屬 Group | access token `cognito:groups: ["TENANT_ADMIN"]` |
+| 2 | Pre Token Lambda | `custom:tenant_id` 屬性 | access token `tenant_id: "tenant-a"` |
+| 3 | API Gateway JWT Authorizer | token | 驗簽、`iss`、`client_id`、`exp`；失敗回 401 |
+| 4 | `CompositeRoleConverter` | `cognito:groups` / `realm_access` | `ROLE_TENANT_ADMIN` |
+| 5 | `SecurityConfig.resolvePrincipalName` | `username` / `preferred_username` / `sub` | `auth.getName() = "tenant-a.admin"`（稽核紀錄用） |
+| 6 | `TenantFilter` | `tenant_id`；無 tenant 且為 ADMIN → `system` | `TenantContext = tenant-a` |
+| 7 | `@PreAuthorize` | authorities | 允許 / 403 |
+| 8 | `ProductQueryService` / `TenantAccessGuard` | TenantContext | 只看得到自己租戶的資料，他租戶 → 404 |
+
+**權限對照表（本次在 AWS 上逐項驗證）**
+
+| 端點 | ADMIN | TENANT_ADMIN | USER | VIEWER | AUDITOR | 無 token |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| `GET /api/products` | ✅ 全部租戶 | ✅ 本租戶 | ✅ 本租戶 | ✅ 本租戶 | — | 401 |
+| `GET /api/products/{id}` | ✅ | ✅ 本租戶（他租戶 404） | ✅ 本租戶 | ✅ 本租戶 | — | 401 |
+| `POST /api/products` | ✅ | ✅ | 403 | 403 | — | 401 |
+| `PUT /api/products/{id}` | ✅ | ✅ 本租戶 | 403 | 403 | — | 401 |
+| `DELETE /api/products/{id}` | ✅ | 403 | 403 | 403 | — | 401 |
+| `GET /api/users/me` | ✅ | ✅ | ✅ | ✅ | ✅ | 401 |
+| `GET /api/v1/audit-logs` | ✅ | 403 | 403 | 403 | ✅ | 401 |
+
+**兩個 App Client 的目的**
+
+| App Client | 允許的流程 | 用途 | 為什麼 |
+|---|---|---|---|
+| `rbac-poc-web` | SRP、Refresh、OAuth2 Code + PKCE、Hosted UI | 瀏覽器 / 行動 App | 公開 client 不放 secret；密碼不以明文送出（SRP） |
+| `rbac-poc-test-harness` | `ADMIN_USER_PASSWORD_AUTH`、Refresh | 自動化驗證腳本 | `AdminInitiateAuth` **需要 IAM 權限**，網際網路上的人無法用這個 client 暴力猜密碼 |
+
+> `custom:tenant_id` **不在任何 App Client 的 WriteAttributes 內**：使用者無法自行把自己改到別的租戶（驗證案例 G1）。
+
+
+---
+
+## 5. AWS 最佳實踐對照
+
+依 AWS Well-Architected Framework（以安全支柱為主）逐項對照本 POC 的做法：
+
+| 面向 | 最佳實踐 | 本 POC 做法 | 對應檔案 |
+|---|---|---|---|
+| 身分 | 不使用 root 做日常操作、root 開 MFA、不留 root access key | root 只用來建立 `poc-admin` 與密碼政策；建議刪除 root access key | §8 Step 0 |
+| 身分 | 人員使用最小權限、強制 MFA | `rbac-poc-deployer` 只拿到 `RbacPocDeployerPolicy` + `RbacPocForceMfaPolicy` | `00-bootstrap-iam.yaml` |
+| 身分 | 職責分離、可稽核的變更 | 所有資源只透過 `RbacPocCfnExecutionRole` 由 CloudFormation 建立 | `env.sh::cfn_deploy` |
+| 身分 | 防止透過建立角色提權 | Permissions Boundary + `iam:PermissionsBoundary` 條件 | `00-bootstrap-iam.yaml` |
+| 身分 | 不使用長期金鑰 | 部署者沒有 access key（只用 Console + CloudShell）；workload 全部用 IAM Role | |
+| 身分 | 密碼政策 | 14 碼、大小寫數字符號、90 天、不可重用 12 次 | §8 Step 0 |
+| 偵測 | 集中日誌、保存期限 | API GW access log、ECS log、CodeBuild log、Lambda log、VPC Flow Logs（REJECT），保留 14 天 | 10/40/50/60 |
+| 偵測 | 應用層稽核 | `audit-lib` 寫入 RDS `audit_logs`，帳號為 Cognito `username` | `audit-lib` |
+| 基礎設施 | 分層網路、最小暴露面 | 3 層子網路；ALB 為 internal；Fargate 無 public IP；RDS 子網路無對外路由 | `10-network.yaml` |
+| 基礎設施 | Security Group 鏈（以 SG 參照而非 CIDR） | vpclink → alb → app → db | `10-network.yaml` |
+| 基礎設施 | 邊界驗證 + 縱深防禦 | API GW JWT Authorizer 擋未驗證流量，服務內仍再驗 JWT 並做 RBAC | `60-api.yaml`、`security-lib` |
+| 基礎設施 | 節流 | API GW 20 rps / burst 50 | `60-api.yaml` |
+| 資料 | 靜態加密 | RDS `StorageEncrypted`、ECR AES256、S3 SSE | 20/40/00 |
+| 資料 | 傳輸加密 | RDS `rds.force_ssl=1` + JDBC `sslmode=require`；S3 bucket policy 拒絕非 TLS | 20、`application-aws.yml` |
+| 資料 | 祕密管理 | RDS 主密碼由 Secrets Manager 產生與託管，ECS 以 `secrets` 注入，template / 腳本 / git 皆無密碼 | 20、50 |
+| 資料 | 租戶隔離 | token `tenant_id` + 服務層過濾 + by-id 存取檢查 | `TenantAccessGuard` |
+| 應用 | 容器強化 | 非 root（UID 65532）、唯讀 root filesystem、`/tmp` 為 ephemeral volume | `Dockerfile.*`、`50-services.yaml` |
+| 應用 | 供應鏈 | Base image 來自 Amazon ECR Public（Corretto）；ECR 不可變 tag + 推送即掃描；CodeBuild 先跑單元測試才推 image | `buildspec.yml` |
+| 可靠性 | 部署保護 | ECS Deployment Circuit Breaker + 自動 rollback；ALB health check | `50-services.yaml` |
+| 成本 | POC 成本最佳化 | 單一 NAT（參數可切 2 個）、`db.t4g.micro`、Fargate 0.5 vCPU、S3 Gateway Endpoint 省 NAT 流量費、log 保留 14 天、ECR 保留 10 個 image | 各 template |
+| 成本 | 用完即清 | `99-cleanup.sh` 依相依順序刪除所有 stack | §12 |
+
+---
+
+## 6. 程式碼改造說明
+
+> 原則：**同一份程式碼同時支援 Keycloak（本地 / Docker / K8s）與 Cognito（AWS）**，以 Spring Profile 切換，不破壞原有部署方式。
+
+| 檔案 | 類型 | 變更 |
+|---|---|---|
+| `libs/security-lib/.../converter/CognitoGroupsRoleConverter.java` | 新增 | `cognito:groups` → `ROLE_*` |
+| `libs/security-lib/.../converter/CompositeRoleConverter.java` | 新增 | 合併 Keycloak 與 Cognito 角色 |
+| `libs/security-lib/.../config/SecurityConfig.java` | 修改 | 使用 Composite converter；principal 名稱依序取 `username` → `preferred_username` → `sub` |
+| `libs/tenant-lib/.../filter/TenantFilter.java` | 修改 | ADMIN 判斷支援 `cognito:groups` |
+| `services/user-service/.../UserProfileService.java` | 修改 | `groups` 為空時改讀 `cognito:groups` |
+| `services/product-service/.../TenantAccessGuard.java` | 新增 | **修正 F1**：by-id 操作檢查租戶 |
+| `services/product-service/.../GlobalExceptionHandler.java` | 新增 | **修正 F2**：404 / 400 / 409 |
+| `services/*/src/main/resources/application-aws.yml` | 新增 | RDS PostgreSQL（schema-per-service）、Cognito issuer、關閉 H2 console |
+| 測試 | 新增 | `CognitoGroupsRoleConverterTest`、`SecurityConfigPrincipalTest`、跨租戶 / fail-closed / 404 測試 |
+
+### 6.1 角色轉換（重點程式碼）
 
 ```java
-@Auditable(eventType = AuditEventType.CREATE_PRODUCT)
-public UUID handle(CreateProductCommand cmd) {
-    // 業務邏輯 - 稽核透過 AOP 自動攔截，無需額外程式碼
+// SecurityConfig.java
+@Bean
+public Converter<Jwt, AbstractAuthenticationToken> jwtAuthenticationConverter() {
+    JwtAuthenticationConverter delegate = new JwtAuthenticationConverter();
+    delegate.setJwtGrantedAuthoritiesConverter(
+        new CompositeRoleConverter(new KeycloakRoleConverter(), new CognitoGroupsRoleConverter()));
+    return jwt -> {
+        AbstractAuthenticationToken token = delegate.convert(jwt);
+        return new JwtAuthenticationToken(jwt, token.getAuthorities(), resolvePrincipalName(jwt));
+    };
 }
 ```
 
-### Domain Event 稽核 (domain-event-for-audit 分支)
+> 為什麼要處理 principal 名稱？Cognito access token 的 `sub` 是 UUID，若不處理，稽核紀錄的使用者會變成一串 UUID。
+
+### 6.2 租戶存取檢查（修正 F1）
 
 ```java
-public UUID handle(CreateProductCommand cmd) {
-    Product product = Product.create(...);
-    eventPublisher.publish(product.pullDomainEvents());
-    // ProductCreated 事件由 AuditDomainEventListener 捕獲並記錄
+static Product requireAccessible(Product product, UUID requestedId) {
+    String currentTenant = TenantContext.getCurrentTenant();
+    if ("system".equals(currentTenant)) return product;                       // ADMIN
+    if (currentTenant == null || !currentTenant.equals(product.getTenantId()))
+        throw new ResourceNotFoundException("Product", requestedId);          // 404, fail-closed
+    return product;
 }
 ```
 
----
-
-## 系統架構
-
-### 整體架構圖
-
-```mermaid
-flowchart TB
-    subgraph Client["Client Layer"]
-        WEB[Web Browser]
-        MOBILE[Mobile App]
-    end
-
-    subgraph Gateway["API Gateway Layer"]
-        GW[Gateway Service<br/>:8080]
-    end
-
-    subgraph Auth["Authentication"]
-        KC[Keycloak<br/>:8180]
-        LDAP[(LDAP Server)]
-    end
-
-    subgraph Services["Microservices Layer"]
-        PS[Product Service<br/>:8081]
-        US[User Service<br/>:8082]
-    end
-
-    subgraph SharedLibs["Shared Libraries"]
-        SL[security-lib]
-        TL[tenant-lib]
-        AL[audit-lib]
-        CL[common-lib]
-    end
-
-    subgraph Data["Data Layer"]
-        DB[(PostgreSQL/H2)]
-    end
-
-    WEB --> GW
-    MOBILE --> GW
-    GW -->|JWT| PS
-    GW -->|JWT| US
-    GW <-->|OAuth2| KC
-    KC <-->|LDAP Bind| LDAP
-    PS --> DB
-    US --> DB
-    PS -.-> SL
-    PS -.-> TL
-    PS -.-> AL
-    US -.-> SL
-    US -.-> TL
-```
-
-### Hexagonal Architecture (Product Service)
-
-```mermaid
-flowchart TB
-    subgraph Adapters["ADAPTERS (Infrastructure Layer)"]
-        subgraph Inbound["Inbound Adapters"]
-            REST[REST Controller<br/>ProductCommandController<br/>ProductQueryController]
-        end
-
-        subgraph Outbound["Outbound Adapters"]
-            JPA[JPA Repository<br/>JpaProductRepository]
-            EVENT[Event Publisher]
-        end
-    end
-
-    subgraph Application["APPLICATION LAYER"]
-        CMD[ProductCommandService<br/>CreateProduct, UpdateProduct, DeleteProduct]
-        QRY[ProductQueryService<br/>GetProductById, ListProducts]
-    end
-
-    subgraph Domain["DOMAIN LAYER"]
-        AGG[Product Aggregate]
-        VO[Value Objects<br/>ProductId, ProductCode, Money, ProductStatus]
-        DE[Domain Events<br/>ProductCreated, ProductUpdated, etc.]
-        REPO[/"ProductRepository<br/>interface<br/>Output Port"/]
-    end
-
-    REST -->|Commands| CMD
-    REST -->|Queries| QRY
-    CMD --> AGG
-    QRY --> AGG
-    CMD --> REPO
-    QRY --> REPO
-    AGG --> VO
-    AGG --> DE
-    JPA -.->|implements| REPO
-```
-
----
-
-## 類別圖
-
-### Domain Layer - Product Aggregate
-
-```mermaid
-classDiagram
-    class Product {
-        -ProductId id
-        -ProductCode productCode
-        -String name
-        -Money price
-        -String description
-        -String category
-        -ProductStatus status
-        -String tenantId
-        -String createdBy
-        -Instant createdAt
-        -String updatedBy
-        -Instant updatedAt
-        -List~DomainEvent~ domainEvents
-        +create(code, name, price, category, desc, tenantId, createdBy)$ Product
-        +update(name, price, category, desc, updatedBy) void
-        +changePrice(newPrice, changedBy) void
-        +delete(deletedBy) void
-        +activate() void
-        +deactivate() void
-        +pullDomainEvents() List~DomainEvent~
-    }
-
-    class ProductId {
-        -UUID value
-        +generate()$ ProductId
-        +of(UUID value)$ ProductId
-        +of(String value)$ ProductId
-    }
-
-    class ProductCode {
-        -String value
-        +of(String value)$ ProductCode
-        +generate()$ ProductCode
-        -validate(String value) void
-    }
-
-    class Money {
-        -BigDecimal amount
-        +of(BigDecimal amount)$ Money
-        +of(double amount)$ Money
-        +zero()$ Money
-        +add(Money other) Money
-        +subtract(Money other) Money
-        +multiply(int n) Money
-        +isPositive() boolean
-        +isZero() boolean
-        +isGreaterThan(Money other) boolean
-        +validatePositive() void
-    }
-
-    class ProductStatus {
-        <<enumeration>>
-        ACTIVE
-        INACTIVE
-        DELETED
-    }
-
-    class DomainEvent {
-        <<interface>>
-        +occurredAt() Instant
-    }
-
-    class ProductCreated {
-        +productId ProductId
-        +productCode ProductCode
-        +name String
-        +price Money
-        +category String
-        +createdBy String
-        +occurredAt Instant
-    }
-
-    class ProductUpdated {
-        +productId ProductId
-        +name String
-        +price Money
-        +category String
-        +updatedBy String
-        +occurredAt Instant
-    }
-
-    class ProductDeleted {
-        +productId ProductId
-        +deletedBy String
-        +occurredAt Instant
-    }
-
-    class ProductPriceChanged {
-        +productId ProductId
-        +oldPrice Money
-        +newPrice Money
-        +changedBy String
-        +occurredAt Instant
-    }
-
-    class ProductRepository {
-        <<interface>>
-        +findById(ProductId id) Optional~Product~
-        +findByProductCode(ProductCode code) Optional~Product~
-        +findAll() List~Product~
-        +findByTenantId(String tenantId) List~Product~
-        +findByCategory(String category) List~Product~
-        +save(Product product) Product
-        +delete(ProductId id) void
-        +existsByProductCode(ProductCode code) boolean
-        +countByTenantId(String tenantId) long
-    }
-
-    Product *-- ProductId
-    Product *-- ProductCode
-    Product *-- Money
-    Product *-- ProductStatus
-    Product o-- DomainEvent
-    ProductCreated ..|> DomainEvent
-    ProductUpdated ..|> DomainEvent
-    ProductDeleted ..|> DomainEvent
-    ProductPriceChanged ..|> DomainEvent
-```
-
-### Application Layer
-
-```mermaid
-classDiagram
-    class ProductCommandService {
-        -ProductRepository repository
-        -TenantContext tenantContext
-        -SecurityContext securityContext
-        +handle(CreateProductCommand cmd) UUID
-        +handle(UpdateProductCommand cmd) void
-        +handle(DeleteProductCommand cmd) void
-    }
-
-    class ProductQueryService {
-        -ProductRepository repository
-        -TenantContext tenantContext
-        +handle(GetProductByIdQuery query) ProductView
-        +handle(ListProductsQuery query) PagedResult~ProductView~
-        -toView(Product product) ProductView
-    }
-
-    class CreateProductCommand {
-        <<record>>
-        +productCode String
-        +name String
-        +price BigDecimal
-        +category String
-        +description String
-    }
-
-    class UpdateProductCommand {
-        <<record>>
-        +productId UUID
-        +name String
-        +price BigDecimal
-        +category String
-        +description String
-    }
-
-    class DeleteProductCommand {
-        <<record>>
-        +productId UUID
-    }
-
-    class GetProductByIdQuery {
-        <<record>>
-        +productId UUID
-    }
-
-    class ListProductsQuery {
-        <<record>>
-        +page int
-        +size int
-        +category String
-        +sortBy String
-        +sortDirection String
-        +defaultQuery()$ ListProductsQuery
-    }
-
-    class ProductView {
-        <<record>>
-        +id UUID
-        +productCode String
-        +name String
-        +price BigDecimal
-        +category String
-        +description String
-        +status String
-        +tenantId String
-        +createdBy String
-        +createdAt Instant
-        +updatedBy String
-        +updatedAt Instant
-    }
-
-    ProductCommandService ..> CreateProductCommand
-    ProductCommandService ..> UpdateProductCommand
-    ProductCommandService ..> DeleteProductCommand
-    ProductQueryService ..> GetProductByIdQuery
-    ProductQueryService ..> ListProductsQuery
-    ProductQueryService ..> ProductView
-```
-
-### Adapter Layer
-
-```mermaid
-classDiagram
-    class ProductCommandController {
-        -ProductCommandService service
-        +createProduct(CreateProductRequest req) ApiResponse~UUID~
-        +updateProduct(UUID id, UpdateProductRequest req) ApiResponse~Void~
-        +deleteProduct(UUID id) void
-    }
-
-    class ProductQueryController {
-        -ProductQueryService service
-        +getProduct(UUID id) ApiResponse~ProductView~
-        +listProducts(page, size, category, sortBy, sortDir) ApiResponse~PagedResult~
-    }
-
-    class CreateProductRequest {
-        <<record>>
-        +productCode String
-        +name String
-        +price BigDecimal
-        +category String
-        +description String
-    }
-
-    class UpdateProductRequest {
-        <<record>>
-        +name String
-        +price BigDecimal
-        +category String
-        +description String
-    }
-
-    class JpaProductRepository {
-        -SpringDataProductRepository repository
-        -ProductMapper mapper
-        +findById(ProductId id) Optional~Product~
-        +findByProductCode(ProductCode code) Optional~Product~
-        +findAll() List~Product~
-        +findByTenantId(String tenantId) List~Product~
-        +save(Product product) Product
-        +delete(ProductId id) void
-        +existsByProductCode(ProductCode code) boolean
-    }
-
-    class ProductJpaEntity {
-        -UUID id
-        -String productCode
-        -String name
-        -BigDecimal price
-        -String category
-        -String description
-        -String status
-        -String tenantId
-        -String createdBy
-        -Instant createdAt
-        -String updatedBy
-        -Instant updatedAt
-    }
-
-    class ProductMapper {
-        +toDomain(ProductJpaEntity entity) Product
-        +toEntity(Product product) ProductJpaEntity
-    }
-
-    class SpringDataProductRepository {
-        <<interface>>
-        +findByProductCode(String code) Optional~ProductJpaEntity~
-        +findByTenantId(String tenantId) List~ProductJpaEntity~
-        +findByCategory(String category) List~ProductJpaEntity~
-        +existsByProductCode(String code) boolean
-    }
-
-    ProductCommandController ..> CreateProductRequest
-    ProductCommandController ..> UpdateProductRequest
-    JpaProductRepository --> SpringDataProductRepository
-    JpaProductRepository --> ProductMapper
-    SpringDataProductRepository --> ProductJpaEntity
-```
-
-### Audit Library
-
-```mermaid
-classDiagram
-    class AuditLog {
-        -AuditLogId id
-        -Instant timestamp
-        -AuditEventType eventType
-        -String aggregateType
-        -String aggregateId
-        -String username
-        -String serviceName
-        -String action
-        -String payload
-        -AuditResult result
-        -String errorMessage
-        -String clientIp
-        -String correlationId
-        -boolean payloadTruncated
-        +builder()$ Builder
-    }
-
-    class AuditLogId {
-        -UUID value
-        +of(UUID value)$ AuditLogId
-        +of(String value)$ AuditLogId
-        +generate()$ AuditLogId
-    }
-
-    class AuditEventType {
-        -String value
-        +of(String value)$ AuditEventType
-        +isValidFormat() boolean
-    }
-
-    class AuditResult {
-        <<enumeration>>
-        SUCCESS
-        FAILURE
-    }
-
-    class AuditLogRepository {
-        <<interface>>
-        +save(AuditLog auditLog) AuditLog
-        +findById(AuditLogId id) Optional~AuditLog~
-        +findByUsername(String username, Pageable pageable) Page~AuditLog~
-        +findByEventType(AuditEventType eventType, Pageable pageable) Page~AuditLog~
-        +findByTimestampBetween(Instant start, Instant end, Pageable pageable) Page~AuditLog~
-        +findByCorrelationId(String correlationId) List~AuditLog~
-    }
-
-    class AuditQueryService {
-        -AuditLogRepository repository
-        +findById(UUID id) Optional~AuditLogView~
-        +findByUsername(String username, int page, int size) PagedResponse~AuditLogView~
-        +findByEventType(String eventType, int page, int size) PagedResponse~AuditLogView~
-        +findByTimeRange(Instant start, Instant end, int page, int size) PagedResponse~AuditLogView~
-        +findByCorrelationId(String correlationId) List~AuditLogView~
-    }
-
-    class AuditEventBuilder {
-        +success() Builder
-        +failure(String errorMessage) Builder
-        +failure(Throwable exception) Builder
-    }
-
-    class AuditableDomainEvent {
-        <<interface>>
-        +aggregateType() String
-        +aggregateId() String
-        +action() String
-        +username() String
-        +serviceName() String
-        +payload() String
-        +isSuccess() boolean
-        +errorMessage() String
-    }
-
-    AuditLog *-- AuditLogId
-    AuditLog *-- AuditEventType
-    AuditLog *-- AuditResult
-    AuditQueryService --> AuditLogRepository
-```
-
-### User Service
-
-```mermaid
-classDiagram
-    class UserController {
-        -UserProfileService service
-        +getCurrentUser() ApiResponse~UserProfileView~
-    }
-
-    class UserProfileService {
-        +getCurrentUserProfile() UserProfileView
-        -extractFromJwt() JwtClaims
-    }
-
-    class UserProfileView {
-        <<record>>
-        +username String
-        +email String
-        +firstName String
-        +lastName String
-        +tenantId String
-        +roles List~String~
-        +groups List~String~
-    }
-
-    UserController --> UserProfileService
-    UserProfileService ..> UserProfileView
-```
-
----
-
-## ER Diagram
-
-### 資料庫結構
-
-```mermaid
-erDiagram
-    PRODUCTS {
-        uuid id PK "Primary Key"
-        varchar product_code UK "Product Code P + 6 digits"
-        varchar name "Product Name"
-        decimal price "Price"
-        varchar category "Category"
-        text description "Description"
-        varchar status "Status ACTIVE INACTIVE DELETED"
-        varchar tenant_id "Tenant ID"
-        varchar created_by "Created By"
-        timestamp created_at "Created At"
-        varchar updated_by "Updated By"
-        timestamp updated_at "Updated At"
-    }
-
-    AUDIT_LOGS {
-        uuid id PK "Primary Key"
-        timestamp timestamp "Event Time"
-        varchar event_type "Event Type"
-        varchar aggregate_type "Aggregate Type"
-        varchar aggregate_id "Aggregate ID"
-        varchar username "Username"
-        varchar service_name "Service Name"
-        varchar action "Action"
-        text payload "Event Payload JSON"
-        varchar result "Result SUCCESS FAILURE"
-        text error_message "Error Message"
-        varchar client_ip "Client IP"
-        varchar correlation_id "Correlation ID"
-        boolean payload_truncated "Payload Truncated"
-    }
-
-    KEYCLOAK_USERS {
-        varchar id PK "Keycloak User ID"
-        varchar username UK "Username"
-        varchar email "Email"
-        varchar first_name "First Name"
-        varchar last_name "Last Name"
-        varchar tenant_id "Tenant ID"
-        boolean enabled "Enabled"
-    }
-
-    KEYCLOAK_GROUPS {
-        varchar id PK "Group ID"
-        varchar name UK "Group Name"
-        varchar parent_group FK "Parent Group"
-    }
-
-    KEYCLOAK_USER_GROUP_MEMBERSHIP {
-        varchar user_id FK "User ID"
-        varchar group_id FK "Group ID"
-    }
-
-    KEYCLOAK_ROLES {
-        varchar id PK "Role ID"
-        varchar name UK "Role Name"
-        varchar description "Description"
-    }
-
-    LDAP_USERS {
-        varchar dn PK "Distinguished Name"
-        varchar uid UK "User ID"
-        varchar cn "Common Name"
-        varchar sn "Surname"
-        varchar mail "Email"
-        varchar tenant_id "Tenant ID"
-        varchar member_of "Group Membership"
-    }
-
-    PRODUCTS ||--o{ AUDIT_LOGS : "generates"
-    KEYCLOAK_USERS ||--o{ KEYCLOAK_USER_GROUP_MEMBERSHIP : "belongs to"
-    KEYCLOAK_GROUPS ||--o{ KEYCLOAK_USER_GROUP_MEMBERSHIP : "contains"
-    KEYCLOAK_USERS ||--o{ KEYCLOAK_ROLES : "has"
-    LDAP_USERS ||--|| KEYCLOAK_USERS : "federates"
-```
-
-### 索引設計
-
-| 表格 | 索引名稱 | 欄位 | 說明 |
-|------|----------|------|------|
-| audit_logs | idx_audit_timestamp | timestamp DESC | 時間查詢 |
-| audit_logs | idx_audit_username | username, timestamp DESC | 使用者查詢 |
-| audit_logs | idx_audit_aggregate | aggregate_type, aggregate_id, timestamp DESC | 聚合查詢 |
-| audit_logs | idx_audit_event_type | event_type, timestamp DESC | 事件類型查詢 |
-| audit_logs | idx_audit_service | service_name, timestamp DESC | 服務查詢 |
-| audit_logs | idx_audit_correlation | correlation_id | 關聯追蹤 |
-| audit_logs | idx_audit_result | result, timestamp DESC | 結果篩選 |
-| products | idx_products_tenant | tenant_id | 租戶查詢 |
-| products | idx_products_category | category | 分類查詢 |
-| products | idx_products_code | product_code (UNIQUE) | 代碼查詢 |
-
----
-
-## 場景序列圖
-
-### 場景 1: 使用者登入認證流程
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant User as 使用者
-    participant Browser as 瀏覽器
-    participant Gateway as API Gateway
-    participant Keycloak as Keycloak
-    participant LDAP as LDAP Server
-    participant Service as 微服務
-
-    User->>Browser: 1. 存取受保護資源
-    Browser->>Gateway: 2. GET /api/products
-    Gateway->>Gateway: 3. 檢查 Token (無效/不存在)
-    Gateway-->>Browser: 4. 302 重導向至 Keycloak
-
-    Browser->>Keycloak: 5. 顯示登入頁面
-    User->>Keycloak: 6. 輸入帳號密碼
-    Keycloak->>LDAP: 7. LDAP Bind 驗證
-    LDAP-->>Keycloak: 8. 驗證成功
-    Keycloak->>Keycloak: 9. 查詢群組/角色
-    Keycloak->>Keycloak: 10. 產生 JWT Token (含 roles, tenant_id)
-    Keycloak-->>Browser: 11. Authorization Code
-
-    Browser->>Gateway: 12. Callback with code
-    Gateway->>Keycloak: 13. 交換 Token
-    Keycloak-->>Gateway: 14. Access Token + Refresh Token
-
-    Browser->>Gateway: 15. GET /api/products (Bearer Token)
-    Gateway->>Service: 16. 轉發請求 (JWT Header)
-    Service->>Service: 17. 驗證 JWT 簽章
-    Service->>Service: 18. 擷取 roles, tenant_id
-    Service-->>Gateway: 19. 回傳資料
-    Gateway-->>Browser: 20. 200 OK
-```
-
-### 場景 2: 建立商品 (含稽核)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client as 客戶端
-    participant Controller as ProductCommandController
-    participant Security as Spring Security
-    participant Audit as @Auditable AOP
-    participant Service as ProductCommandService
-    participant Product as Product Aggregate
-    participant Repo as ProductRepository
-    participant DB as Database
-
-    Client->>Controller: POST /api/products
-    Controller->>Security: 驗證 JWT Token
-    Security->>Security: 檢查角色 (ADMIN/TENANT_ADMIN)
-    Security-->>Controller: 授權成功
-
-    Controller->>Audit: @Auditable 攔截
-    Audit->>Audit: 記錄開始時間
-
-    Audit->>Service: proceed() 執行
-    Service->>Service: 取得 SecurityContext.username
-    Service->>Service: 取得 TenantContext.tenantId
-    Service->>Repo: existsByProductCode(code)
-    Repo-->>Service: false (不重複)
-
-    Service->>Product: Product.create(code, name, price, ...)
-    Product->>Product: 驗證 price > 0
-    Product->>Product: 設定 status = ACTIVE
-    Product->>Product: registerEvent(ProductCreated)
-    Product-->>Service: product instance
-
-    Service->>Repo: save(product)
-    Repo->>DB: INSERT INTO products
-    DB-->>Repo: OK
-    Repo-->>Service: saved product
-
-    Service-->>Audit: return productId
-    Audit->>Audit: 建立 AuditLog (SUCCESS)
-    Audit->>DB: INSERT INTO audit_logs
-
-    Audit-->>Controller: productId
-    Controller-->>Client: 201 Created { id: uuid }
-```
-
-### 場景 3: 多租戶資料隔離
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client as 客戶端 (Tenant-A)
-    participant Filter as TenantFilter
-    participant Context as TenantContext
-    participant Service as ProductQueryService
-    participant Repo as ProductRepository
-    participant DB as Database
-
-    Client->>Filter: GET /api/products<br/>Authorization: Bearer JWT
-    Filter->>Filter: 解析 JWT Token
-    Filter->>Filter: 擷取 claim: tenant_id = tenant-a
-    Filter->>Context: setCurrentTenant(tenant-a)
-
-    Filter->>Service: handle(ListProductsQuery)
-    Service->>Context: getCurrentTenant()
-    Context-->>Service: tenant-a
-
-    alt 系統管理員 (tenant == system)
-        Service->>Repo: findAll()
-        Note over Service,Repo: 系統管理員可查看所有租戶資料
-    else 一般租戶
-        Service->>Repo: findByTenantId(tenant-a)
-        Note over Service,Repo: 只能查看自己租戶的資料
-    end
-
-    Repo->>DB: SELECT * WHERE tenant_id = tenant-a
-    DB-->>Repo: products (filtered)
-    Repo-->>Service: List of Product
-
-    Service->>Service: 過濾 ACTIVE 狀態
-    Service->>Service: 分頁處理
-    Service-->>Filter: PagedResult of ProductView
-
-    Filter->>Context: clear()
-    Filter-->>Client: 200 OK { products: [...] }
-```
-
-### 場景 4: RBAC 權限驗證失敗
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client as 客戶端
-    participant Controller as ProductCommandController
-    participant Security as Spring Security
-    participant Handler as AccessDeniedHandler
-
-    Client->>Controller: DELETE /api/products/id<br/>Authorization: Bearer JWT
-    Controller->>Security: @PreAuthorize hasRole ADMIN
-    Security->>Security: 解析 JWT Token
-    Security->>Security: 取得 roles: ROLE_TENANT_ADMIN
-    Security->>Security: 檢查: ROLE_ADMIN in roles?
-    Security-->>Security: false (無權限)
-
-    Security->>Handler: AccessDeniedException
-    Handler-->>Client: 403 Forbidden<br/>{ error: Access Denied }
-```
-
-### 場景 5: Domain Event 稽核流程
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client as 客戶端
-    participant Controller as Controller
-    participant Service as ProductCommandService
-    participant Product as Product Aggregate
-    participant Publisher as EventPublisher
-    participant Listener as AuditEventListener
-    participant AuditRepo as AuditLogRepository
-    participant DB as Database
-
-    Client->>Controller: POST /api/products
-    Controller->>Service: handle(CreateProductCommand)
-
-    Service->>Product: Product.create(...)
-    Product->>Product: 初始化屬性
-    Product->>Product: registerEvent(ProductCreated)
-    Note over Product: 事件暫存於聚合內部
-
-    Product-->>Service: product instance
-    Service->>Service: 儲存 Product
-
-    Service->>Product: pullDomainEvents()
-    Product-->>Service: [ProductCreated]
-
-    Service->>Publisher: publish(ProductCreated)
-    Publisher->>Publisher: Spring ApplicationEventPublisher
-
-    Publisher->>Listener: @EventListener
-    Listener->>Listener: 轉換為 AuditLog
-    Note over Listener: eventType: CREATE_PRODUCT<br/>username, tenantId, payload
-
-    Listener->>AuditRepo: save(auditLog)
-    AuditRepo->>DB: INSERT INTO audit_logs
-    DB-->>AuditRepo: OK
-
-    Service-->>Controller: productId
-    Controller-->>Client: 201 Created
-```
-
----
-
-## RBAC 權限控制
-
-### 角色層級
-
-```mermaid
-graph TB
-    subgraph Roles["角色層級"]
-        ADMIN[ADMIN<br/>系統管理員]
-        TENANT_ADMIN[TENANT_ADMIN<br/>租戶管理員]
-        USER[USER<br/>一般使用者]
-        VIEWER[VIEWER<br/>唯讀使用者]
-    end
-
-    subgraph Permissions["權限"]
-        P1[商品管理 CRUD]
-        P2[使用者管理]
-        P3[商品新增/編輯]
-        P4[商品查看]
-    end
-
-    ADMIN --> P1
-    ADMIN --> P2
-    TENANT_ADMIN --> P3
-    TENANT_ADMIN --> P4
-    USER --> P4
-    VIEWER --> P4
-```
-
-### 權限對照表
-
-| 端點 | ADMIN | TENANT_ADMIN | USER | VIEWER |
-|------|:-----:|:------------:|:----:|:------:|
-| `GET /api/products` | Yes | Yes | Yes | Yes |
-| `GET /api/products/{id}` | Yes | Yes | Yes | Yes |
-| `POST /api/products` | Yes | Yes | No | No |
-| `PUT /api/products/{id}` | Yes | Yes | No | No |
-| `DELETE /api/products/{id}` | Yes | No | No | No |
-| `GET /api/users/me` | Yes | Yes | Yes | Yes |
-| `GET /api/admin/users` | Yes | No | No | No |
-
----
-
-## BDD 測試案例
-
-### 商品管理 (product-management.feature)
-
-```gherkin
-# language: zh-TW
-功能: 商品管理
-  作為系統管理員
-  我希望能夠管理商品
-  以便維護商品目錄
-
-  背景:
-    假設 系統已初始化預設資料
-
-  場景: 管理員建立新商品
-    假設 使用者 "admin" 已登入系統，角色為 "ADMIN"
-    當 使用者建立商品:
-      | 商品名稱    | 價格  | 分類     | 描述           |
-      | 測試商品 A | 1000  | 電子產品 | 這是測試商品 A |
-    那麼 系統應回傳成功訊息
-    而且 商品應該被成功建立
-
-  場景: 租戶管理員建立商品
-    假設 使用者 "tenant-admin" 已登入系統，角色為 "TENANT_ADMIN"
-    當 使用者建立商品:
-      | 商品名稱    | 價格 | 分類 | 描述           |
-      | 租戶商品 B | 500  | 服飾 | 這是租戶商品 B |
-    那麼 系統應回傳成功訊息
-    而且 商品應該被成功建立
-
-  場景: 一般使用者無法建立商品
-    假設 使用者 "user" 已登入系統，角色為 "USER"
-    當 使用者嘗試建立商品:
-      | 商品名稱 | 價格 | 分類 | 描述         |
-      | 違規商品 | 100  | 其他 | 這不應該成功 |
-    那麼 系統應回傳權限不足錯誤
-
-  場景: 管理員查詢商品列表
-    假設 使用者 "admin" 已登入系統，角色為 "ADMIN"
-    當 使用者查詢所有商品
-    那麼 系統應回傳商品列表
-    而且 列表應包含預設的 10 筆商品
-
-  場景: 管理員刪除商品
-    假設 使用者 "admin" 已登入系統，角色為 "ADMIN"
-    而且 系統中存在商品 "待刪除商品"
-    當 使用者刪除該商品
-    那麼 系統應回傳成功訊息
-    而且 商品狀態應該為 "DELETED"
-```
-
-### 角色權限控制 (rbac.feature)
-
-```gherkin
-# language: zh-TW
-功能: 角色權限控制
-  作為系統
-  我需要根據使用者角色控制存取權限
-  以確保系統安全
-
-  場景大綱: 角色存取控制
-    假設 使用者 "<使用者>" 已登入系統，角色為 "<角色>"
-    當 使用者嘗試存取 "<端點>"
-    那麼 系統應回傳 "<結果>"
-
-    例子:
-      | 使用者       | 角色         | 端點              | 結果 |
-      | admin        | ADMIN        | /api/products     | 200  |
-      | admin        | ADMIN        | /api/admin/users  | 200  |
-      | tenant-admin | TENANT_ADMIN | /api/products     | 200  |
-      | tenant-admin | TENANT_ADMIN | /api/admin/users  | 403  |
-      | user         | USER         | /api/products     | 200  |
-      | user         | USER         | /api/products/new | 403  |
-      | viewer       | VIEWER       | /api/products     | 200  |
-      | viewer       | VIEWER       | /api/products/new | 403  |
-
-  場景: 未認證使用者無法存取受保護端點
-    假設 使用者未登入
-    當 使用者嘗試存取 "/api/products"
-    那麼 系統應回傳 "401"
-
-  場景: 無效 Token 被拒絕
-    假設 使用者持有無效的 JWT Token
-    當 使用者嘗試存取 "/api/products"
-    那麼 系統應回傳 "401"
-```
-
-### 多租戶資料隔離 (multi-tenant.feature)
-
-```gherkin
-# language: zh-TW
-功能: 多租戶資料隔離
-  作為多租戶系統
-  我需要確保不同租戶的資料互相隔離
-  以保護租戶資料安全
-
-  背景:
-    假設 系統中存在兩個租戶:
-      | 租戶 ID  | 租戶名稱 |
-      | tenant-a | 租戶 A   |
-      | tenant-b | 租戶 B   |
-
-  場景: 租戶只能查看自己的商品
-    假設 租戶 "tenant-a" 有商品 "商品 A1" 和 "商品 A2"
-    而且 租戶 "tenant-b" 有商品 "商品 B1"
-    當 租戶 "tenant-a" 的使用者查詢商品列表
-    那麼 只應看到屬於 "tenant-a" 的商品
-    而且 不應看到 "tenant-b" 的商品
-
-  場景: 系統管理員可以查看所有租戶商品
-    假設 租戶 "tenant-a" 有商品 "商品 A1"
-    而且 租戶 "tenant-b" 有商品 "商品 B1"
-    當 系統管理員查詢所有商品
-    那麼 應看到所有租戶的商品
-
-  場景: 租戶無法存取其他租戶的商品
-    假設 租戶 "tenant-a" 有商品 "私密商品"，ID 為 "prod-001"
-    當 租戶 "tenant-b" 的使用者嘗試存取商品 "prod-001"
-    那麼 系統應回傳資源不存在錯誤
-```
-
----
-
-## 測試案例說明
-
-### 測試統計總覽
-
-| 模組 | 測試類型 | 測試數量 | 覆蓋率 |
-|------|----------|:--------:|:------:|
-| product-service | Unit Tests | 124 | 96% |
-| user-service | Unit Tests | 10 | 96% |
-| gateway-service | Unit Tests | 10 | 92% |
-| audit-lib | Unit Tests | 150+ | 67% |
-| scenario-tests | Cucumber BDD | 18 scenarios | - |
-| Docker Integration | Shell Script | 16 | - |
-| K8s Integration | Shell Script | 36 | - |
-| **Total** | | **344+** | **80%+** |
-
-### Product Service 測試案例
-
-#### Domain Layer 測試
-
-| 測試類別 | 測試案例 | 說明 |
-|----------|----------|------|
-| `MoneyTest` | shouldCreateMoneyWithValidAmount | 正數金額建立成功 |
-| | shouldThrowWhenAmountIsNegative | 負數金額拋出例外 |
-| | shouldAddMoneyCorrectly | 加法運算正確 |
-| | shouldSubtractMoneyCorrectly | 減法運算正確 |
-| | shouldMultiplyMoneyCorrectly | 乘法運算正確 |
-| `ProductCodeTest` | shouldCreateValidProductCode | 有效格式 (P + 6位數字) |
-| | shouldThrowForInvalidFormat | 無效格式拋出例外 |
-| | shouldGenerateUniqueCode | 自動產生唯一代碼 |
-| `ProductTest` | shouldCreateProduct | 建立商品並發布 ProductCreated 事件 |
-| | shouldUpdateProduct | 更新商品並發布 ProductUpdated 事件 |
-| | shouldChangePrice | 變更價格並發布 ProductPriceChanged 事件 |
-| | shouldDeleteProduct | 軟刪除並發布 ProductDeleted 事件 |
-
-#### Application Layer 測試
-
-| 測試類別 | 測試案例 | 說明 |
-|----------|----------|------|
-| `ProductCommandServiceTest` | shouldCreateProductWithProvidedCode | 使用指定商品代碼建立 |
-| | shouldGenerateCodeWhenNotProvided | 自動產生商品代碼 |
-| | shouldThrowWhenProductCodeExists | 代碼重複時拋出例外 |
-| | shouldUpdateProduct | 更新商品資訊 |
-| | shouldDeleteProduct | 刪除商品 (狀態變為 DELETED) |
-| `ProductQueryServiceTest` | shouldReturnProductWhenFound | 查詢存在的商品 |
-| | shouldThrowWhenProductNotFound | 商品不存在時拋出例外 |
-| | shouldReturnOnlyTenantProducts | 多租戶資料隔離 |
-| | shouldPaginateResults | 分頁功能正確 |
-
-#### Adapter Layer 測試
-
-| 測試類別 | 測試案例 | 說明 |
-|----------|----------|------|
-| `ProductCommandControllerTest` | shouldReturn401WhenNotAuthenticated | 未認證回傳 401 |
-| | shouldReturn403WhenUserRoleInsufficient | 權限不足回傳 403 |
-| | shouldCreateProductWhenAdmin | ADMIN 可建立商品 |
-| | shouldDeleteProductWhenAdmin | 只有 ADMIN 可刪除 |
-| `ProductQueryControllerTest` | shouldReturn401WhenNotAuthenticated | 未認證回傳 401 |
-| | shouldReturnProductWhenAuthenticated | 認證後可查詢商品 |
-
----
-
-## Docker 整合測試
-
-### 執行整合測試
-
-```bash
-# 使用整合測試腳本
-./deploy/scripts/integration-test.sh
-
-# 手動啟動並測試
-docker compose -f deploy/docker/docker-compose.yml up -d
-curl http://localhost:8080/actuator/health  # Gateway
-curl http://localhost:8081/actuator/health  # Product Service
-curl http://localhost:8082/actuator/health  # User Service
-```
-
-### 服務端口對照
-
-| 服務 | 端口 | 說明 |
-|------|------|------|
-| Gateway | 8080 | API 閘道 |
-| Product Service | 8081 | 商品管理服務 |
-| User Service | 8082 | 使用者服務 |
-| Keycloak | 8180 | SSO/OAuth2 認證 |
-| phpLDAPadmin | 8181 | LDAP 管理介面 |
-| PostgreSQL | 5432 | Keycloak 資料庫 |
-| OpenLDAP | 389/636 | 使用者目錄 |
-
----
-
-## Kubernetes 整合測試
-
-### K8s 測試項目
-
-| 測試類別 | 測試項目 | 數量 |
-|----------|----------|:----:|
-| Cluster | Kind cluster 存在檢查 | 1 |
-| Namespace | rbac-sso namespace 檢查 | 1 |
-| Config | ConfigMap 和 Secret 檢查 | 2 |
-| PVC | PersistentVolumeClaim 狀態 | 3 |
-| Pod 狀態 | 6 個服務 Pod 運行狀態 | 6 |
-| Pod Ready | 6 個服務 Pod 就緒狀態 | 6 |
-| Service | 6 個 ClusterIP Service | 6 |
-| NodePort | 4 個 NodePort Service | 4 |
-| 健康檢查 | HTTP 端點檢查 | 4 |
-| API 認證 | 401 回應驗證 | 2 |
-| Keycloak | Admin Console 可訪問 | 1 |
-| **Total** | | **36** |
-
-### 執行 K8s 整合測試
-
-```bash
-# 完整部署 (含建置 Docker images)
-./deploy/scripts/k8s-deploy.sh --build
-
-# 執行整合測試
-./deploy/scripts/k8s-integration-test.sh
-
-# 刪除 cluster
-./deploy/scripts/k8s-deploy.sh --delete
-```
-
----
-
-## mTLS 東西向安全 (Spring Boot + cert-manager)
-
-### 架構概述
-
-本專案實作了基於 Spring Boot SSL Bundle + cert-manager 的 mTLS (Mutual TLS) 方案，用於服務間的雙向認證和加密通訊。
-
-```mermaid
-flowchart TB
-    subgraph CertManager["cert-manager (憑證管理)"]
-        SI[SelfSigned Issuer]
-        CA[CA Certificate]
-        CAI[CA Issuer]
-    end
-
-    subgraph Certs["服務憑證"]
-        GC[Gateway TLS Secret]
-        PC[Product Service TLS Secret]
-        UC[User Service TLS Secret]
-    end
-
-    subgraph Services["微服務 (mTLS 啟用)"]
-        GW[Gateway<br/>:8080 HTTPS]
-        PS[Product Service<br/>:8081 HTTPS]
-        US[User Service<br/>:8082 HTTPS]
-    end
-
-    SI -->|簽發| CA
-    CA -->|建立| CAI
-    CAI -->|簽發| GC
-    CAI -->|簽發| PC
-    CAI -->|簽發| UC
-
-    GC -->|掛載| GW
-    PC -->|掛載| PS
-    UC -->|掛載| US
-
-    GW <-->|mTLS| PS
-    GW <-->|mTLS| US
-    PS <-->|mTLS| US
-```
-
-### 憑證結構
-
-```
-/etc/ssl/certs/
-├── tls.crt      # 服務憑證 (由 CA 簽發)
-├── tls.key      # 私鑰
-└── ca.crt       # CA 憑證 (用於驗證對方服務)
-```
-
-### mTLS 配置檔案
-
-| 檔案路徑 | 說明 |
-|----------|------|
-| `deploy/k8s/security/cert-manager/ca-issuer.yaml` | CA Issuer 和根憑證配置 |
-| `deploy/k8s/security/cert-manager/service-certificates.yaml` | 各服務的憑證申請 |
-| `deploy/k8s/services-mtls/*.yaml` | mTLS 啟用的 K8s 部署配置 |
-| `services/*/src/main/resources/application-mtls.yml` | Spring Boot mTLS 配置 |
-| `libs/audit-lib/.../MtlsWebClientConfiguration.java` | mTLS WebClient 配置類 |
-
-### Spring Boot SSL Bundle 配置
-
-```yaml
-# application-mtls.yml
-server:
-  port: 8081
-  ssl:
-    enabled: true
-    certificate: /etc/ssl/certs/tls.crt
-    certificate-private-key: /etc/ssl/certs/tls.key
-    client-auth: need  # 強制客戶端憑證驗證
-    trust-store: /etc/ssl/certs/ca.crt
-    enabled-protocols: TLSv1.3,TLSv1.2
-
-spring:
-  ssl:
-    bundle:
-      pem:
-        mtls-bundle:
-          keystore:
-            certificate: /etc/ssl/certs/tls.crt
-            private-key: /etc/ssl/certs/tls.key
-          truststore:
-            certificate: /etc/ssl/certs/ca.crt
-```
-
-### cert-manager 憑證資源
-
-```yaml
-# service-certificates.yaml
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
-  name: product-service-tls
-  namespace: rbac-sso
-spec:
-  secretName: product-service-tls-secret
-  duration: 8760h    # 1 年
-  renewBefore: 720h  # 30 天前自動更新
-  commonName: product-service
-  privateKey:
-    algorithm: ECDSA
-    size: 256
-  usages:
-    - server auth
-    - client auth
-  dnsNames:
-    - product-service
-    - product-service.rbac-sso.svc.cluster.local
-  issuerRef:
-    name: rbac-sso-ca-issuer
-    kind: ClusterIssuer
-```
-
-### 使用 mTLS WebClient
-
-```java
-@Autowired
-@Qualifier("mtlsWebClient")
-private WebClient mtlsWebClient;
-
-// 呼叫其他服務 (自動帶客戶端憑證)
-String response = mtlsWebClient.get()
-    .uri("https://product-service:8081/api/products")
-    .retrieve()
-    .bodyToMono(String.class)
-    .block();
-```
-
-### 部署 mTLS 環境
-
-```bash
-# 1. 安裝 cert-manager
-./deploy/scripts/k8s-mtls-deploy.sh --install-cert-manager
-
-# 2. 部署含 mTLS 的服務 (需先建置 Docker images)
-./deploy/scripts/k8s-mtls-deploy.sh --build
-
-# 3. 驗證 mTLS 連線
-./deploy/scripts/k8s-mtls-deploy.sh --verify
-
-# 4. 查看憑證狀態
-kubectl get certificates -n rbac-sso
-```
-
-### 安全控管狀態
-
-| 層級 | 控制項 | 狀態 | 說明 |
-|------|--------|:----:|------|
-| **南北向** | OAuth2/OIDC | Done | Keycloak 整合 |
-| | JWT 驗證 | Done | Spring Security |
-| | RBAC 權限控制 | Done | 角色基礎存取控制 |
-| **東西向** | OAuth2 Client Credentials | Done | ServiceTokenProvider |
-| | mTLS | Done | Spring Boot + cert-manager |
-| | 憑證自動更新 | Done | cert-manager renewBefore |
-
-### mTLS 序列圖
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant CM as cert-manager
-    participant GW as Gateway
-    participant PS as Product Service
-
-    Note over CM: 憑證簽發流程
-    CM->>CM: 建立 Self-Signed CA
-    CM->>GW: 簽發 gateway-tls-secret
-    CM->>PS: 簽發 product-service-tls-secret
-
-    Note over GW,PS: mTLS 握手
-    GW->>PS: ClientHello
-    PS->>GW: ServerHello + Certificate
-    PS->>GW: CertificateRequest
-    GW->>PS: Certificate (Gateway's cert)
-    GW->>PS: CertificateVerify
-    PS->>PS: 驗證 Gateway 憑證 (使用 CA)
-    GW->>GW: 驗證 Product Service 憑證 (使用 CA)
-
-    Note over GW,PS: 加密通訊
-    GW->>PS: HTTPS Request (encrypted)
-    PS->>GW: HTTPS Response (encrypted)
-```
-
----
-
-## Keycloak LDAP 整合教學
-
-### Step 1: 安裝 Keycloak
-
-```bash
-docker run -d --name keycloak \
-  -p 8180:8080 \
-  -e KEYCLOAK_ADMIN=admin \
-  -e KEYCLOAK_ADMIN_PASSWORD=admin \
-  quay.io/keycloak/keycloak:24.0 start-dev
-```
-
-### Step 2: 設定 LDAP User Federation
-
-| 設定項 | 值 |
-|--------|-----|
-| Vendor | Other |
-| Connection URL | `ldap://ldap-server:389` |
-| Bind DN | `cn=admin,dc=example,dc=com` |
-| Users DN | `ou=users,dc=example,dc=com` |
-| Username LDAP attribute | `uid` |
-
-### Step 3: 應用程式設定
+### 6.3 AWS Profile
 
 ```yaml
 spring:
-  security:
-    oauth2:
-      resourceserver:
-        jwt:
-          issuer-uri: http://localhost:8180/realms/ecommerce
+  datasource:
+    url: jdbc:postgresql://${DB_HOST}:${DB_PORT:5432}/${DB_NAME:rbacpoc}?currentSchema=product&sslmode=require
+    username: ${DB_USERNAME}     # ECS 從 Secrets Manager 注入
+    password: ${DB_PASSWORD}
+  flyway: { schemas: product, create-schemas: true }     # audit_logs 由 audit-lib 的 Flyway 建立
+  security.oauth2.resourceserver.jwt.issuer-uri: ${COGNITO_ISSUER_URI}
 ```
 
 ---
 
-## 快速開始
+## 7. 基礎設施即程式碼（CloudFormation 00–60）
 
-### 環境需求
+| Stack | 檔案 | 部署者 | 主要資源 | 時間 |
+|---|---|---|---|---|
+| `rbac-poc-00-bootstrap-iam` | `00-bootstrap-iam.yaml` | **poc-admin**（一次性） | CFN 執行角色、Boundary、部署者群組 / 政策、artifact bucket | ~1 分 |
+| `rbac-poc-10-network` | `10-network.yaml` | deployer | VPC、6 子網路、NAT、S3 endpoint、4 個 SG、Flow Logs | ~3 分 |
+| `rbac-poc-20-data` | `20-data.yaml` | deployer | RDS PostgreSQL 16、參數群組（force_ssl） | ~10 分 |
+| `rbac-poc-30-identity` | `30-identity.yaml` | deployer | User Pool、5 Groups、2 App Clients、Hosted UI domain、Pre-token Lambda | ~1 分 |
+| `rbac-poc-40-build` | `40-build.yaml` | deployer | 2 ECR repo、CodeBuild project | ~1 分 |
+| `rbac-poc-50-services` | `50-services.yaml` | deployer | ECS cluster、2 task def / service、internal ALB、listener rules | ~5 分 |
+| `rbac-poc-60-api` | `60-api.yaml` | deployer | HTTP API、VPC Link、JWT Authorizer、route、stage | ~2 分 |
 
-- Java 17+
-- Gradle 8.5+
-- Docker
-- Kind (for K8s testing)
+Stack 之間以 **CloudFormation Exports / ImportValue** 串接（例如 `rbac-poc-issuer-uri`、`rbac-poc-db-secret-arn`），刪除時需反向順序。
 
-### 建置與測試
+### 7.1 腳本
 
-```bash
-# 編譯專案
-./gradlew build
+| 腳本 | 執行身分 | 作用 |
+|---|---|---|
+| `aws/scripts/env.sh` | — | 共用設定；`cfn_deploy` 一律帶 `--role-arn RbacPocCfnExecutionRole` |
+| `00-bootstrap-iam.sh` | poc-admin | 部署 IAM bootstrap；偵測到 deployer user 已存在時只加入群組；拒絕 root 執行 |
+| `01-preflight.sh` | deployer | 身分、region、bootstrap 輸出、template 驗證 |
+| `10-deploy-foundation.sh` | deployer | network → (data ∥ identity → build) |
+| `20-build-images.sh` | deployer | 打包原始碼 → S3 → CodeBuild（單元測試 + image）→ 取得 image tag |
+| `30-deploy-services.sh` | deployer | ECS + ALB → API Gateway → 等待 service stable |
+| `40-seed-users.sh` | deployer | 建立 6 個測試帳號；**隨機密碼只存在 CloudShell `~/.rbac-poc/test-users.env`（600）** |
+| `50-verify.sh` | deployer | 端到端驗證並輸出 Markdown 報告 |
+| `99-cleanup.sh [--all]` | deployer / poc-admin | 反向刪除 stack；`--all` 另刪 artifact bucket 與 IAM bootstrap |
+| `deploy-all.sh` | deployer | 01 → 50 一次跑完 |
 
-# 執行所有測試
-./gradlew test
+<!-- SECTIONS-8+ -->
 
-# 產生測試覆蓋率報告
-./gradlew jacocoTestReport
-```
-
-### 啟動服務
-
-```bash
-# 啟動 Gateway Service (Port 8080)
-./gradlew :services:gateway-service:bootRun
-
-# 啟動 Product Service (Port 8081)
-./gradlew :services:product-service:bootRun
-
-# 啟動 User Service (Port 8082)
-./gradlew :services:user-service:bootRun
-```
-
----
-
-## 專案結構
-
-```
-rbac-sso-poc/
-├── libs/                           # 共用函式庫
-│   ├── common-lib/                 # 共用 DTO、Exception
-│   ├── security-lib/               # OAuth2 安全設定
-│   ├── tenant-lib/                 # 多租戶支援
-│   └── audit-lib/                  # 稽核日誌
-│       ├── domain/                 # AuditLog, AuditLogId, AuditEventType
-│       ├── application/            # AuditQueryService
-│       └── infrastructure/         # JPA 實作
-│
-├── services/                       # 微服務
-│   ├── product-service/            # 商品服務 (:8081)
-│   │   └── src/main/java/.../
-│   │       ├── domain/             # Product, ProductId, Money, ProductCode
-│   │       ├── application/        # CommandService, QueryService
-│   │       └── adapter/            # REST Controllers, JPA
-│   ├── user-service/               # 使用者服務 (:8082)
-│   └── gateway-service/            # API 閘道 (:8080)
-│
-├── tests/                          # 測試
-│   └── scenario-tests/             # Cucumber BDD 測試
-│       └── features/               # .feature 檔案
-│
-├── deploy/                         # 部署設定
-│   ├── docker/                     # Docker Compose
-│   ├── k8s/                        # Kubernetes
-│   └── scripts/                    # 部署腳本
-│
-├── specs/                          # Spec Kit 規格文件
-├── PRD.md                          # 產品需求文件
-├── TECH.md                         # 技術架構文件
-├── INFRA.md                        # 基礎設施文件
-└── README.md                       # 本文件
-```
-
----
-
-## 技術堆疊
-
-| 類別 | 技術 | 版本 |
-|------|------|------|
-| 語言 | Java | 17 |
-| 框架 | Spring Boot | 3.3.x |
-| 安全 | Spring Security OAuth2 | 6.x |
-| 資料存取 | Spring Data JPA | 3.3.x |
-| 閘道 | Spring Cloud Gateway | 4.x |
-| 認證 | Keycloak | 24.x |
-| 資料庫 | PostgreSQL / H2 | 15 / 2.x |
-| 測試 | JUnit 5, Mockito, Cucumber | 5.x |
-| 架構測試 | ArchUnit | 1.2.x |
-| 容器 | Docker, Kubernetes | - |
-| 建置 | Gradle | 8.5 |
-
----
-
-## License
-
-Private - Internal Use Only
