@@ -21,3 +21,5 @@
 | 12:27 | deployer | 第三次部署 services（新 image） | 兩個服務皆啟動；user-service log 出現 `syntax error at or near "user"`：schema 名 `user` 為 PostgreSQL 保留字 → 改為 `user_service`，重新建置 | 18 |
 | 12:55 | deployer | services / api 部署完成、seed 6 位使用者 | API endpoint `https://1v70386w88.execute-api.us-east-1.amazonaws.com` | 19, 20 |
 | 12:56 | deployer | `50-verify.sh` 第一次 | 11 pass / 42 fail：**驗證腳本本身的 bug**（`local m=... args=(... "$m")` 同一行宣告時 `$m` 尚未賦值 → curl `-X` 空白）；另 deployer 無 `ecr:DescribeImageScanFindings` | |
+| 12:58 | deployer | `50-verify.sh` 第二次 | 27 pass / 25 fail：所有 GET 由 ALB 回 400（`server: awselb/2.0`）。原因 ALB `desync_mitigation_mode=strictest` → 改 `defensive` 並 update stack | 21 |
+| 13:00 | deployer | ALB 改 defensive 後 `50-verify.sh` 第三次 | **52 passed, 0 failed, 1 skipped**（ECR scan 讀取權限） | 22, 23, 24, 25 |

@@ -41,6 +41,12 @@ while True:
     subprocess.run(["aws","s3api","delete-objects","--bucket",b,"--delete",json.dumps({"Objects":objs,"Quiet":True})], check=True)
 PY
   fi
+  # Log groups created by AWS services themselves (not by CloudFormation) survive stack deletion
+  for prefix in "/aws/rds/instance/${PROJECT}-" "/aws/ecs/containerinsights/${PROJECT}-" "/aws/lambda/${PROJECT}-" "/aws/codebuild/${PROJECT}-" "/${PROJECT}/"; do
+    for lg in $(aws logs describe-log-groups --log-group-name-prefix "$prefix" --query 'logGroups[].logGroupName' --output text); do
+      log "deleting log group $lg"; aws logs delete-log-group --log-group-name "$lg"
+    done
+  done
   log "deleting $STACK_BOOTSTRAP (needs administrator)"
   aws cloudformation delete-stack --stack-name "$STACK_BOOTSTRAP"
   aws cloudformation wait stack-delete-complete --stack-name "$STACK_BOOTSTRAP" && ok "bootstrap deleted"

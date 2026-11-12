@@ -4,7 +4,18 @@
 > 把開源元件替換為 AWS 技術棧、實際部署到 AWS 帳號、以自動化腳本驗證 RBAC / 多租戶 / 稽核行為，並在驗證後清除所有計費資源。
 > **原專案的全部程式碼、腳本、K8s / Docker 部署檔都保留**，原始文件移至 [`docs/original/`](docs/original/)。
 
-<!-- RESULT-SUMMARY -->
+## 成果摘要
+
+| 項目 | 結果 |
+|---|---|
+| 部署環境 | AWS 帳號（us-east-1），全程透過 Console + CloudShell，部署者為最小權限 IAM User `rbac-poc-deployer` |
+| 單元測試（在 AWS CodeBuild 執行） | **144 tests, 0 failures** |
+| 端到端驗證（`aws/scripts/50-verify.sh`） | **52 passed, 0 failed, 1 skipped**（詳見 [驗證報告](docs/verify-report.md)） |
+| 修正原專案既有缺陷 | 4 項（F1 跨租戶 by-id 存取、F2 缺少例外處理器導致 500、F3 gradle-wrapper.jar 未進版控、F5 `@EnableJpaRepositories` 讓 22 個 Controller 測試失敗），見 [§1.2](#12-評估時發現的問題已在本-repo-修正) |
+| 部署過程踩到並修正的問題 | 12 項，全部記錄在 [§10](#10-疑難排解實際踩到的坑) 與 [`docs/deployment-log.md`](docs/deployment-log.md) |
+| 截圖 | 25 張，位於 [`docs/images/`](docs/images/) |
+| 計費資源 | 驗證完成後**全部清除**（見 [§12](#12-清除所有計費資源)） |
+
 
 ---
 
@@ -50,8 +61,9 @@
 | F2 | **沒有任何 `@ControllerAdvice`** | `ResourceNotFoundException` 變成 HTTP 500 | 新增 `GlobalExceptionHandler`（404 / 400 / 409），刻意不攔截 `AccessDeniedException`，讓 Spring Security 維持 401/403 |
 | F3 | `gradle-wrapper.jar` 被 `.gitignore` 的 `*.jar` 排除 | clone 後無法執行 `./gradlew` | 補回 wrapper jar 並修正 `.gitignore` |
 | F4 | 角色只從 Keycloak 專屬 claim（`realm_access`）解析 | 換 IdP 就失效 | `CompositeRoleConverter` 同時支援 Keycloak 與 Cognito（`cognito:groups`），本地 / K8s / AWS 共用同一份程式碼 |
+| F5 | `ProductServiceApplication` 上的 `@EnableJpaRepositories` / `@EntityScan` 讓所有 `@WebMvcTest` slice 測試啟動失敗（22 個 Controller 測試 fail；原 README 宣稱 100% 通過已不成立） | CI 無法作為品質閘門 | 移到 `config/JpaConfig`（於 AWS CodeBuild 首次建置時發現） |
 
-<!-- F-EXTRA -->
+
 
 ---
 
@@ -233,7 +245,7 @@ flowchart TB
 | `poc-admin` | IAM User + `AdministratorAccess` | 一次性部署 IAM bootstrap（建角色、政策、群組） | 讓建立 IAM 這種高權限動作與日常部署分離 |
 | `rbac-poc-deployer` | IAM User（無 access key，只用 Console + CloudShell） | 日常部署、驗證、清除 | **最小權限**：本身不能直接建 VPC/RDS/ECS，只能透過 CloudFormation 執行角色 |
 | `RbacPocDeployers` | IAM Group | 權限掛在群組而非個人 | 人員異動只要調整群組成員 |
-| `RbacPocDeployerPolicy` | Customer managed policy | 限制 stack 名稱、PassRole 對象、Region、Cognito pool tag | 避免部署者動到其他專案資源 |
+| `RbacPocDeployerPolicy` | Customer managed policy | 限制 stack 名稱、PassRole 對象、Region、Cognito pool tag；可讀取本專案 ECR 掃描結果與 CodeBuild 測試報表 | 避免部署者動到其他專案資源；讀取權限也限定在 `rbac-poc*` 資源 |
 | `RbacPocForceMfaPolicy` | Customer managed policy | 沒有 MFA 時拒絕所有動作 | 強制 MFA |
 | `RbacPocCfnExecutionRole` | Service role（CloudFormation） | 實際建立所有資源 | **職責分離**：人只有「交給 CFN」的權限；所有變更都有 stack 紀錄可追蹤、可回滾 |
 | `rbac-poc-workload-boundary` | Permissions Boundary | 所有 workload 角色的權限上限 | 防止「透過建立高權限角色提權」：CFN 執行角色若建立不掛 Boundary 的角色會被 IAM 拒絕 |
@@ -327,6 +339,7 @@ flowchart LR
 | 身分 | 密碼政策 | 14 碼、大小寫數字符號、90 天、不可重用 12 次 | §8 Step 0 |
 | 偵測 | 集中日誌、保存期限 | API GW access log、ECS log、CodeBuild log、Lambda log、VPC Flow Logs（REJECT），保留 14 天 | 10/40/50/60 |
 | 偵測 | 應用層稽核 | `audit-lib` 寫入 RDS `audit_logs`，帳號為 Cognito `username` | `audit-lib` |
+| 基礎設施 | HTTP desync 防護 | ALB `desync_mitigation_mode=defensive`、丟棄無效 header | `50-services.yaml` |
 | 基礎設施 | 分層網路、最小暴露面 | 3 層子網路；ALB 為 internal；Fargate 無 public IP；RDS 子網路無對外路由 | `10-network.yaml` |
 | 基礎設施 | Security Group 鏈（以 SG 參照而非 CIDR） | vpclink → alb → app → db | `10-network.yaml` |
 | 基礎設施 | 邊界驗證 + 縱深防禦 | API GW JWT Authorizer 擋未驗證流量，服務內仍再驗 JWT 並做 RBAC | `60-api.yaml`、`security-lib` |
@@ -552,7 +565,9 @@ CodeBuild 依序執行：`security-lib` / `tenant-lib` / `product-service` / `us
 ./aws/scripts/30-deploy-services.sh
 ```
 
-<!-- STEP5-IMAGES -->
+![services 與 API 部署完成](docs/images/19-services-api-deployed.jpg)
+![CloudFormation stacks](docs/images/24-cfn-stacks-complete.jpg)
+![ECS cluster：2 個服務、2 個 task 執行中](docs/images/25-ecs-cluster-running.jpg)
 
 ### Step 6：建立測試帳號
 
@@ -560,7 +575,9 @@ CodeBuild 依序執行：`security-lib` / `tenant-lib` / `product-service` / `us
 ./aws/scripts/40-seed-users.sh
 ```
 
-<!-- STEP6-IMAGES -->
+密碼由腳本以 `openssl rand` 產生，只存在 CloudShell 的 `~/.rbac-poc/test-users.env`（權限 600），不會進 git、不會印在畫面上。
+
+![建立測試帳號](docs/images/20-seed-users.jpg)
 
 ### Step 7：端到端驗證
 
@@ -568,14 +585,29 @@ CodeBuild 依序執行：`security-lib` / `tenant-lib` / `product-service` / `us
 ./aws/scripts/50-verify.sh
 ```
 
-<!-- STEP7-IMAGES -->
+![驗證 1–20](docs/images/22-verify-pass-1.jpg)
+![驗證 21–53](docs/images/23-verify-pass-2.jpg)
 
 
 ---
 
 ## 9. 驗證結果
 
-<!-- VERIFY-RESULTS -->
+最終結果：**52 passed, 0 failed, 1 skipped**（2026-11-12 13:00 UTC，`rbac-poc-deployer` 於 CloudShell 執行）。完整報告見 [`docs/verify-report.md`](docs/verify-report.md)。
+
+| 區塊 | 驗證內容 | 案例數 | 結果 |
+|---|---|:-:|:-:|
+| A. 邊界驗證 | 無 token / 亂碼 token / **竄改 payload（USER→ADMIN）** 皆被 API Gateway 以 401 擋下；未定義路徑 404 | 4 | ✅ |
+| B. Token 內容 | `token_use=access`、`cognito:groups`、Lambda 注入的 `tenant_id` / email、issuer | 6 | ✅ |
+| C. RBAC 矩陣 | ADMIN 全 CRUD；TENANT_ADMIN 不能刪；USER / VIEWER 只能讀；輸入驗證 400 | 15 | ✅ |
+| D. user-service | `/api/users/me` 的 username、tenant、roles、groups、firstName 皆來自 Cognito token | 6 | ✅ |
+| E. 多租戶隔離 | 列表只見本租戶；**他租戶 by-id GET / PUT 回 404**（F1 修正生效）；ADMIN 跨租戶可見；tenant_id 寫入 RDS | 11 | ✅ |
+| F. 稽核 | `audit_logs` 記錄 PRODUCT_CREATED / PRODUCT_DELETED 與 Cognito 使用者名稱；只有 ADMIN / AUDITOR 可查 | 5 | ✅ |
+| G. 安全態勢 | 使用者**無法自行修改 `custom:tenant_id`**；ALB 為 internal；RDS 非公開且加密；Fargate task 無 public IP | 5 | ✅ |
+| G. ECR 掃描 | deployer 當時沒有讀取掃描結果的權限 → SKIP（`00-bootstrap-iam.yaml` 已補上唯讀權限） | 1 | ⏭️ |
+
+> **驗證的意義**：A 證明未驗證流量根本進不了 VPC；C + E 證明授權在服務內仍然生效（縱深防禦，不只靠 API Gateway）；E-37/38 證明本次修正的跨租戶漏洞在雲端環境確實被堵住；G-48 證明「租戶身分」無法被使用者自行竄改。
+
 
 ---
 
@@ -595,7 +627,9 @@ CodeBuild 依序執行：`security-lib` / `tenant-lib` / `product-service` / `us
 | 10-8 | 重新部署前 | `aws cloudformation wait stack-rollback-complete` 一直等不到 | 該 waiter 只認 `UPDATE_ROLLBACK_COMPLETE`；**建立失敗**的回滾狀態是 `ROLLBACK_COMPLETE` | 直接 `describe-stacks` 檢查狀態後 `delete-stack` |
 | 10-9 | Step 5 ECS | init container 成功（`tmp-ready`）後，app 啟動失敗：`Unable to determine source type <S> and target type <T> for your Converter` | **本次改造引入的錯誤**：把 JWT converter 寫成 lambda `@Bean`；Spring MVC 會把所有 `Converter` bean 註冊進 conversion service，lambda 的泛型無法解析。slice 測試不載入 SecurityConfig，所以單元測試沒抓到 | 改為具名類別 `PrincipalAwareJwtAuthenticationConverter`，並新增「可註冊進 conversion service」的回歸測試 |
 | 10-10 | Step 5 ECS | user-service log：`syntax error at or near "user"`（`alter table if exists user.audit_logs ...`） | schema-per-service 把 user-service 的 schema 取名為 `user`，**`user` 是 PostgreSQL 保留字**，Hibernate 產生的 DDL / SQL 沒有加引號 | schema 改名為 `user_service`。連帶影響：`audit-lib` 的 `AuditHealthIndicator` 查詢 `user.audit_logs` 失敗 → `/actuator/health` 回 DOWN(503) → ALB 判定 unhealthy → Circuit Breaker 回滾 |
-<!-- TROUBLE-EXTRA -->
+| 10-11 | Step 7 驗證 | 所有 **GET** 回 `400 Bad Request`，回應 header 為 `server: awselb/2.0`；POST/PUT/DELETE 正常 | ALB 設了 `routing.http.desync_mitigation_mode=strictest`：API Gateway 轉送的 GET 被 ALB 歸類為「acceptable」而非「compliant」，strictest 模式只放行 compliant | 改回 AWS 預設 `defensive`（仍會防護 HTTP desync） |
+| 10-12 | Step 7 驗證 | 驗證腳本 curl 出現 `option -X: blank argument` | **腳本 bug**：`local m="$1" ... args=(... -X "$m")` 寫在同一行時，`$m` 在賦值前就被展開 | 拆成兩個 `local` 宣告 |
+
 
 **通用除錯指令**
 
