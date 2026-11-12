@@ -31,5 +31,5 @@ echo "$TAG" > "$STATE_DIR/image-tag"
 ok "images pushed with tag $TAG (saved to $STATE_DIR/image-tag)"
 # Unit-test summary is printed by buildspec into the build log (deployer has no codebuild report read rights)
 aws logs filter-log-events --log-group-name "/aws/codebuild/${PROJECT}-build" \
-  --log-stream-names "${BUILD_ID#*:}" --filter-pattern '"TEST SUMMARY"' \
-  --query 'events[0].message' --output text 2>/dev/null | sed 's/^/  /'
+  --log-stream-names "${BUILD_ID#*:}" --filter-pattern '"TEST SUMMARY: tests="' \
+  --query 'events[].message' --output text 2>/dev/null | tr '\t' '\n' | grep -E 'tests=[0-9]' | sed 's/^/  /'

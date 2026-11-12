@@ -1,12 +1,12 @@
 # ============================================================
 # AWS profile (SPRING_PROFILES_ACTIVE=aws)
-#   - Amazon RDS for PostgreSQL（schema-per-service: user）
+#   - Amazon RDS for PostgreSQL（schema-per-service: user_service；"user" 是 PostgreSQL 保留字，不能當 schema 名）
 #   - Amazon Cognito 作為 OAuth2 / OIDC Issuer
 #   - 帳密由 ECS 從 Secrets Manager（RDS managed secret）注入環境變數
 # ============================================================
 spring:
   datasource:
-    url: jdbc:postgresql://${DB_HOST}:${DB_PORT:5432}/${DB_NAME:rbacpoc}?currentSchema=user&sslmode=require
+    url: jdbc:postgresql://${DB_HOST}:${DB_PORT:5432}/${DB_NAME:rbacpoc}?currentSchema=user_service&sslmode=require
     username: ${DB_USERNAME}
     password: ${DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
@@ -18,12 +18,12 @@ spring:
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
-        default_schema: user
+        default_schema: user_service
     show-sql: false
   flyway:
     enabled: true
-    schemas: user
-    default-schema: user
+    schemas: user_service
+    default-schema: user_service
     create-schemas: true
     baseline-on-migrate: true
   h2:

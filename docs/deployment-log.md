@@ -17,3 +17,5 @@
 | 11:52 | deployer | `30-deploy-services.sh` | ECS task 啟動失敗：`Unable to create tempDir. java.io.tmpdir is set to /tmp` / `AccessDeniedException`。原因：Fargate 的 ephemeral bind volume 預設為 root:root 0755，非 root 容器（UID 65532）無法寫入。修正：加入 init container（root、執行 `chmod 1777 /tmp` 後結束），app 容器 `DependsOn: SUCCESS`；仍維持非 root + 唯讀 root FS | 16 |
 | 12:0x | deployer | 刪除 ROLLBACK_COMPLETE 的 services stack | 注意：`wait stack-rollback-complete` 不適用建立失敗（ROLLBACK_COMPLETE），會一直等待 | |
 | 12:13 | deployer | 第二次部署 services | init container `tmp-ready` 成功；app 啟動失敗 `Unable to determine source type <S> and target type <T> for your Converter`（本次改造的 lambda @Bean 造成）→ 改具名類別 + 回歸測試，重新 CodeBuild | 17 |
+| 12:15 | deployer | CodeBuild #4 | 成功，`TEST SUMMARY: tests=144 failures=0 errors=0 skipped=0`，image tag `20261112121507-4` | |
+| 12:27 | deployer | 第三次部署 services（新 image） | 兩個服務皆啟動；user-service log 出現 `syntax error at or near "user"`：schema 名 `user` 為 PostgreSQL 保留字 → 改為 `user_service`，重新建置 | 18 |
