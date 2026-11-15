@@ -9,7 +9,7 @@ include 'libs:tenant-lib'
 // ===== 微服務 =====
 include 'services:product-service'
 include 'services:user-service'
-include 'services:gateway-service'
+// services:gateway-service 已移除（Spring Cloud Gateway → AWS API Gateway）
 
 // ===== 應用程式 (保留既有) =====
 include 'apps:rbac-demo'

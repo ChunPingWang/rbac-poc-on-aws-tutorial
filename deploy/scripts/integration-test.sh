@@ -90,7 +90,6 @@ test_service_health() {
     log_test "服務健康檢查"
 
     local services=(
-        "Gateway:http://localhost:8080/actuator/health"
         "Product Service:http://localhost:8081/actuator/health"
         "User Service:http://localhost:8082/actuator/health"
         "Keycloak:http://localhost:8180/health/ready"
@@ -149,16 +148,22 @@ test_api_unauthorized() {
     fi
 }
 
-# 測試 5: Gateway 路由
-test_gateway_routing() {
-    log_test "Gateway 路由測試"
+# 測試 5: 服務直連（gateway-service 已移除，用戶端直接呼叫各服務）
+test_direct_service_access() {
+    log_test "服務直連測試（無 API Gateway）"
 
-    # Gateway actuator 應該可以訪問
-    local response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/actuator/health)
+    local response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/actuator/health)
     if [ "$response" = "200" ]; then
-        pass_test "Gateway actuator 端點可訪問"
+        pass_test "Product Service 可直接存取 (8081)"
     else
-        fail_test "Gateway actuator 端點返回 $response"
+        fail_test "Product Service 直連返回 $response"
+    fi
+
+    response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8082/actuator/health)
+    if [ "$response" = "200" ]; then
+        pass_test "User Service 可直接存取 (8082)"
+    else
+        fail_test "User Service 直連返回 $response"
     fi
 }
 
@@ -182,7 +187,6 @@ test_container_status() {
         "rbac-openldap"
         "rbac-postgres"
         "rbac-keycloak"
-        "rbac-gateway"
         "rbac-product-service"
         "rbac-user-service"
     )
@@ -215,9 +219,8 @@ main() {
 
     # 檢查服務是否已啟動
     local running_containers=$(docker ps --filter "name=rbac-" --format "{{.Names}}" | wc -l)
-    if [ "$running_containers" -lt 6 ]; then
+    if [ "$running_containers" -lt 5 ]; then   # 共 6 個容器（gateway 已移除）
         log_warn "Docker 服務未完全啟動，正在等待..."
-        wait_for_service "Gateway" "http://localhost:8080/actuator/health" 60
         wait_for_service "Product Service" "http://localhost:8081/actuator/health" 60
         wait_for_service "User Service" "http://localhost:8082/actuator/health" 60
     fi
@@ -239,7 +242,7 @@ main() {
     echo ""
     test_api_unauthorized
     echo ""
-    test_gateway_routing
+    test_direct_service_access
     echo ""
     test_keycloak_admin
 

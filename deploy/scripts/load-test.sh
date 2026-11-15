@@ -20,7 +20,10 @@ NC='\033[0m'
 
 # 預設設定
 KEYCLOAK_URL="${KEYCLOAK_URL:-http://localhost:8180}"
-GATEWAY_URL="${GATEWAY_URL:-http://localhost:8080}"
+# 已移除 gateway-service（Spring Cloud）：直接呼叫各服務
+PRODUCT_URL="${PRODUCT_URL:-http://localhost:8081}"
+USER_URL="${USER_URL:-http://localhost:8082}"
+TARGET_OVERRIDE=""   # 非空時所有請求都打到這個 base URL（例如 Keycloak token 端點）
 CLIENT_ID="${CLIENT_ID:-ecommerce-api}"
 CLIENT_SECRET="${CLIENT_SECRET:-}"
 USERNAME="${USERNAME:-admin.user}"
@@ -60,13 +63,26 @@ log_result() {
     echo -e "${CYAN}[RESULT]${NC} $1"
 }
 
+# 依端點決定要打哪個服務（取代原本的閘道路由）
+target_url() {
+    local endpoint=$1
+    if [ -n "$TARGET_OVERRIDE" ]; then
+        echo "$TARGET_OVERRIDE"
+    elif [[ "$endpoint" == /api/users* ]]; then
+        echo "$USER_URL"
+    else
+        echo "$PRODUCT_URL"
+    fi
+}
+
 # 檢查服務健康狀態
 check_health() {
     log_info "檢查服務健康狀態..."
 
     local services=(
         "Keycloak:$KEYCLOAK_URL/health/ready"
-        "Gateway:$GATEWAY_URL/actuator/health"
+        "Product Service:$PRODUCT_URL/actuator/health"
+        "User Service:$USER_URL/actuator/health"
     )
 
     local all_healthy=true
@@ -155,9 +171,9 @@ load_test_curl() {
 
             local result
             if [ "$method" = "POST" ] && [ -n "$data" ]; then
-                result=$(eval curl $curl_opts -X POST -H "'Content-Type: application/json'" -d "'$data'" "$GATEWAY_URL$endpoint")
+                result=$(eval curl $curl_opts -X POST -H "'Content-Type: application/json'" -d "'$data'" "$(target_url "$endpoint")$endpoint")
             else
-                result=$(eval curl $curl_opts "$GATEWAY_URL$endpoint")
+                result=$(eval curl $curl_opts "$(target_url "$endpoint")$endpoint")
             fi
 
             local http_code="${result%%:*}"
@@ -231,7 +247,7 @@ load_test_hey() {
         hey_opts="$hey_opts -H 'Authorization: Bearer $ACCESS_TOKEN'"
     fi
 
-    eval hey $hey_opts "$GATEWAY_URL$endpoint"
+    eval hey $hey_opts "$(target_url "$endpoint")$endpoint"
 }
 
 # 使用 ab 進行壓測 (如果有安裝)
@@ -252,7 +268,7 @@ load_test_ab() {
         ab_opts="$ab_opts -H 'Authorization: Bearer $ACCESS_TOKEN'"
     fi
 
-    eval ab $ab_opts "$GATEWAY_URL$endpoint"
+    eval ab $ab_opts "$(target_url "$endpoint")$endpoint"
 }
 
 # 執行預設測試套件
@@ -276,11 +292,10 @@ run_test_suite() {
     local token_requests=$((REQUESTS / 10))  # Token 請求數減少
     REQUESTS=$token_requests load_test_curl "" "POST" "" &
     # 直接對 Keycloak 測試
-    local old_gateway=$GATEWAY_URL
-    GATEWAY_URL=$KEYCLOAK_URL
+    TARGET_OVERRIDE=$KEYCLOAK_URL
     load_test_curl "/realms/$REALM/protocol/openid-connect/token" "POST" \
         "client_id=$CLIENT_ID&username=$USERNAME&password=$PASSWORD&grant_type=password"
-    GATEWAY_URL=$old_gateway
+    TARGET_OVERRIDE=""
 }
 
 # 顯示使用說明
@@ -296,7 +311,8 @@ show_usage() {
     echo "  -c, --concurrent N   並發連線數 (預設: $CONCURRENT)"
     echo "  -n, --requests N     總請求數 (預設: $REQUESTS)"
     echo "  -d, --duration N     測試持續時間秒數 (預設: $DURATION)"
-    echo "  -g, --gateway URL    Gateway URL (預設: $GATEWAY_URL)"
+    echo "  --product-url URL    Product Service URL (預設: $PRODUCT_URL)"
+    echo "  --user-url URL       User Service URL (預設: $USER_URL)"
     echo "  -k, --keycloak URL   Keycloak URL (預設: $KEYCLOAK_URL)"
     echo "  -u, --user NAME      測試用戶名 (預設: $USERNAME)"
     echo "  -p, --password PASS  測試密碼 (預設: $PASSWORD)"
@@ -304,7 +320,7 @@ show_usage() {
     echo "  -h, --help           顯示說明"
     echo ""
     echo "環境變數:"
-    echo "  KEYCLOAK_URL, GATEWAY_URL, CLIENT_ID, CLIENT_SECRET"
+    echo "  KEYCLOAK_URL, PRODUCT_URL, USER_URL, CLIENT_ID, CLIENT_SECRET"
     echo "  USERNAME, PASSWORD, REALM"
     echo ""
     echo "範例:"
@@ -338,8 +354,12 @@ main() {
                 DURATION="$2"
                 shift 2
                 ;;
-            -g|--gateway)
-                GATEWAY_URL="$2"
+            --product-url)
+                PRODUCT_URL="$2"
+                shift 2
+                ;;
+            --user-url)
+                USER_URL="$2"
                 shift 2
                 ;;
             -k|--keycloak)
@@ -383,7 +403,8 @@ main() {
     print_banner
 
     echo -e "${BLUE}測試配置:${NC}"
-    echo "  Gateway URL:  $GATEWAY_URL"
+    echo "  Product URL:  $PRODUCT_URL"
+    echo "  User URL:     $USER_URL"
     echo "  Keycloak URL: $KEYCLOAK_URL"
     echo "  並發數:       $CONCURRENT"
     echo "  請求數:       $REQUESTS"

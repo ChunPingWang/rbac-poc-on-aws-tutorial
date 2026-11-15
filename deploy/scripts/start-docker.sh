@@ -134,7 +134,7 @@ start_services() {
 
     if [ "$infra_only" = false ]; then
         # 等待應用服務
-        for svc in gateway user-service product-service; do
+        for svc in user-service product-service; do
             port=$(docker inspect "rbac-$svc" --format '{{range $p, $conf := .NetworkSettings.Ports}}{{(index $conf 0).HostPort}}{{end}}' 2>/dev/null || echo "")
             if [ -n "$port" ]; then
                 echo -n "  $svc: "
@@ -174,7 +174,6 @@ show_status() {
     echo -e "\n${BLUE}=== 存取資訊 ===${NC}"
     echo "Keycloak Admin:    http://localhost:8180 (admin / admin123)"
     echo "phpLDAPadmin:      http://localhost:8181"
-    echo "Gateway:           http://localhost:8080"
     echo "User Service:      http://localhost:8081"
     echo "Product Service:   http://localhost:8082"
 }
@@ -219,7 +218,7 @@ show_usage() {
     echo "  build       建置 Docker images"
     echo "  clean       停止並清理所有資源 (包含 volumes)"
     echo ""
-    echo "Services: openldap, postgres, keycloak, phpldapadmin, gateway, user-service, product-service"
+    echo "Services: openldap, postgres, keycloak, phpldapadmin, user-service, product-service"
 }
 
 # ==============================================================================

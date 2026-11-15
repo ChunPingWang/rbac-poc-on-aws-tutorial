@@ -153,7 +153,8 @@ start_java_apps() {
     }
 
     # 啟動各服務 (背景執行)
-    local services=("gateway:8080" "user-service:8081" "product-service:8082")
+    # gateway-service 已移除（Spring Cloud Gateway 由 AWS API Gateway 取代）；用戶端直接呼叫各服務
+    local services=("user-service:8081" "product-service:8082")
 
     for svc_port in "${services[@]}"; do
         svc="${svc_port%%:*}"
@@ -224,7 +225,6 @@ show_status() {
     echo -e "\n${BLUE}=== 存取資訊 ===${NC}"
     echo "Keycloak Admin:    http://localhost:8180 (admin / admin123)"
     echo "phpLDAPadmin:      http://localhost:8181"
-    echo "Gateway:           http://localhost:8080"
     echo "User Service:      http://localhost:8081"
     echo "Product Service:   http://localhost:8082"
 }
@@ -241,7 +241,7 @@ show_logs() {
             keycloak|openldap|postgres|phpldapadmin)
                 docker logs -f "rbac-$service"
                 ;;
-            gateway|user-service|product-service)
+            user-service|product-service)
                 if [ -f "$PROJECT_ROOT/logs/$service.log" ]; then
                     tail -f "$PROJECT_ROOT/logs/$service.log"
                 else
@@ -267,7 +267,7 @@ show_usage() {
     echo "  logs      顯示 Docker 日誌"
     echo "  logs <service>  顯示特定服務日誌"
     echo ""
-    echo "Services: keycloak, openldap, postgres, gateway, user-service, product-service"
+    echo "Services: keycloak, openldap, postgres, user-service, product-service"
 }
 
 # ==============================================================================

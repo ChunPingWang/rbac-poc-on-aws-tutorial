@@ -137,7 +137,7 @@ setup_certificates() {
 
     # 等待服務憑證簽發
     log_info "等待服務憑證簽發..."
-    for cert in gateway-tls product-service-tls user-service-tls keycloak-tls; do
+    for cert in product-service-tls user-service-tls keycloak-tls; do
         for i in {1..30}; do
             status=$(kubectl get certificate $cert -n $NAMESPACE -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
             if [ "$status" = "True" ]; then
@@ -161,18 +161,14 @@ build_images() {
     ./gradlew clean build -x test
 
     # 建置 Docker 映像
-    log_info "建置 Gateway 映像..."
-    docker build -t rbac-gateway:latest -f services/gateway-service/Dockerfile .
-
     log_info "建置 Product Service 映像..."
-    docker build -t rbac-product-service:latest -f services/product-service/Dockerfile .
+    docker build -t rbac-product-service:latest -f deploy/docker/Dockerfile.product-service .
 
     log_info "建置 User Service 映像..."
-    docker build -t rbac-user-service:latest -f services/user-service/Dockerfile .
+    docker build -t rbac-user-service:latest -f deploy/docker/Dockerfile.user-service .
 
     # 載入映像到 Kind
     log_info "載入映像到 Kind cluster..."
-    kind load docker-image rbac-gateway:latest --name "$CLUSTER_NAME"
     kind load docker-image rbac-product-service:latest --name "$CLUSTER_NAME"
     kind load docker-image rbac-user-service:latest --name "$CLUSTER_NAME"
 }
@@ -198,13 +194,11 @@ deploy_infrastructure() {
 deploy_mtls_services() {
     log_step "部署 mTLS 應用服務..."
 
-    kubectl apply -f "$PROJECT_ROOT/deploy/k8s/services-mtls/gateway-mtls.yaml"
     kubectl apply -f "$PROJECT_ROOT/deploy/k8s/services-mtls/product-service-mtls.yaml"
     kubectl apply -f "$PROJECT_ROOT/deploy/k8s/services-mtls/user-service-mtls.yaml"
 
     # 等待應用服務就緒
     log_info "等待應用服務就緒..."
-    kubectl wait --for=condition=Ready pod -l app=gateway -n $NAMESPACE --timeout=300s || true
     kubectl wait --for=condition=Ready pod -l app=product-service -n $NAMESPACE --timeout=300s || true
     kubectl wait --for=condition=Ready pod -l app=user-service -n $NAMESPACE --timeout=300s || true
 }
@@ -213,18 +207,18 @@ deploy_mtls_services() {
 verify_mtls() {
     log_step "驗證 mTLS 連線..."
 
-    # 在 gateway pod 中測試 mTLS 連線
-    GATEWAY_POD=$(kubectl get pod -l app=gateway -n $NAMESPACE -o jsonpath='{.items[0].metadata.name}')
+    # 在 user-service pod 中測試 mTLS 連線（gateway 已移除；user-service 同樣掛載 CA 與自身憑證）
+    CLIENT_POD=$(kubectl get pod -l app=user-service -n $NAMESPACE -o jsonpath='{.items[0].metadata.name}')
 
-    if [ -z "$GATEWAY_POD" ]; then
-        log_error "找不到 Gateway Pod"
+    if [ -z "$CLIENT_POD" ]; then
+        log_error "找不到 User Service Pod"
         return 1
     fi
 
-    log_info "從 Gateway Pod 測試 mTLS 連線到 Product Service..."
+    log_info "從 User Service Pod 測試 mTLS 連線到 Product Service..."
 
     # 使用 curl 測試 mTLS 連線
-    kubectl exec -n $NAMESPACE "$GATEWAY_POD" -- \
+    kubectl exec -n $NAMESPACE "$CLIENT_POD" -- \
         curl -v --cacert /etc/ssl/certs/ca.crt \
              --cert /etc/ssl/certs/tls.crt \
              --key /etc/ssl/certs/tls.key \
@@ -348,7 +342,7 @@ main() {
     echo "=== 使用說明 ==="
     echo "驗證 mTLS: ./deploy/scripts/k8s-mtls-deploy.sh --verify"
     echo "查看憑證: kubectl get certificates -n $NAMESPACE"
-    echo "查看 Pod 日誌: kubectl logs -n $NAMESPACE -l app=gateway"
+    echo "查看 Pod 日誌: kubectl logs -n $NAMESPACE -l app=product-service"
 }
 
 main "$@"

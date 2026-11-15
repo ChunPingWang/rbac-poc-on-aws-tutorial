@@ -111,9 +111,6 @@ build_images() {
     ./gradlew clean build -x test
 
     # 建立 Docker images
-    log_info "建立 Gateway image..."
-    docker build -t rbac-gateway:latest -f deploy/docker/Dockerfile.gateway .
-
     log_info "建立 Product Service image..."
     docker build -t rbac-product-service:latest -f deploy/docker/Dockerfile.product-service .
 
@@ -127,7 +124,6 @@ build_images() {
 load_images() {
     log_step "載入 images 到 Kind cluster..."
 
-    kind load docker-image rbac-gateway:latest --name "$CLUSTER_NAME"
     kind load docker-image rbac-product-service:latest --name "$CLUSTER_NAME"
     kind load docker-image rbac-user-service:latest --name "$CLUSTER_NAME"
 
@@ -166,9 +162,6 @@ deploy_to_k8s() {
     kubectl wait --for=condition=ready pod -l app=keycloak -n rbac-sso --timeout=300s || true
 
     # 部署應用服務
-    log_info "部署 Gateway..."
-    kubectl apply -f "$K8S_DIR/services/gateway.yaml"
-
     log_info "部署 Product Service..."
     kubectl apply -f "$K8S_DIR/services/product-service.yaml"
 
@@ -186,7 +179,7 @@ deploy_to_k8s() {
 wait_for_services() {
     log_step "等待所有服務就緒..."
 
-    local services=("openldap" "postgres" "keycloak" "gateway" "product-service" "user-service")
+    local services=("openldap" "postgres" "keycloak" "product-service" "user-service")
 
     for service in "${services[@]}"; do
         log_info "等待 $service..."
@@ -206,7 +199,6 @@ show_status() {
     kubectl get all -n rbac-sso
     echo ""
     log_info "存取服務:"
-    echo "  - Gateway:         http://localhost:8080"
     echo "  - Product Service: http://localhost:8081"
     echo "  - User Service:    http://localhost:8082"
     echo "  - Keycloak:        http://localhost:8180"

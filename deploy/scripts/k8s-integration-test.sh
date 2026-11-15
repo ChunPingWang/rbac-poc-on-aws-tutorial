@@ -115,7 +115,7 @@ test_namespace_exists() {
 test_pod_status() {
     log_test "Pod 狀態檢查"
 
-    local pods=("openldap" "postgres" "keycloak" "gateway" "product-service" "user-service")
+    local pods=("openldap" "postgres" "keycloak" "product-service" "user-service")
 
     for pod in "${pods[@]}"; do
         local status=$(kubectl get pods -n "$NAMESPACE" -l app="$pod" -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
@@ -131,7 +131,7 @@ test_pod_status() {
 test_pod_ready() {
     log_test "Pod Ready 狀態檢查"
 
-    local pods=("openldap" "postgres" "keycloak" "gateway" "product-service" "user-service")
+    local pods=("openldap" "postgres" "keycloak" "product-service" "user-service")
 
     for pod in "${pods[@]}"; do
         local ready=$(kubectl get pods -n "$NAMESPACE" -l app="$pod" -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
@@ -147,7 +147,7 @@ test_pod_ready() {
 test_services_exist() {
     log_test "Service 存在檢查"
 
-    local services=("openldap" "postgres" "keycloak" "gateway" "product-service" "user-service")
+    local services=("openldap" "postgres" "keycloak" "product-service" "user-service")
 
     for svc in "${services[@]}"; do
         if kubectl get service "$svc" -n "$NAMESPACE" >/dev/null 2>&1; then
@@ -162,7 +162,7 @@ test_services_exist() {
 test_nodeport_services() {
     log_test "NodePort Service 檢查"
 
-    local services=("gateway-nodeport" "product-service-nodeport" "user-service-nodeport" "keycloak-nodeport")
+    local services=("product-service-nodeport" "user-service-nodeport" "keycloak-nodeport")
 
     for svc in "${services[@]}"; do
         if kubectl get service "$svc" -n "$NAMESPACE" >/dev/null 2>&1; then
@@ -178,7 +178,6 @@ test_service_health() {
     log_test "服務健康檢查 (HTTP)"
 
     local services=(
-        "Gateway:http://localhost:8080/actuator/health"
         "Product Service:http://localhost:8081/actuator/health"
         "User Service:http://localhost:8082/actuator/health"
         "Keycloak:http://localhost:8180/health/ready"
@@ -264,11 +263,11 @@ test_pvc_status() {
 test_internal_dns() {
     log_test "內部 DNS 解析測試"
 
-    local services=("openldap" "postgres" "keycloak" "gateway" "product-service" "user-service")
+    local services=("openldap" "postgres" "keycloak" "product-service" "user-service")
 
     for svc in "${services[@]}"; do
-        # 使用 gateway pod 來測試 DNS 解析
-        local result=$(kubectl exec -n "$NAMESPACE" deploy/gateway -- nslookup "$svc.$NAMESPACE.svc.cluster.local" 2>/dev/null | grep -c "Address" || echo "0")
+        # 使用 user-service pod 來測試 DNS 解析（gateway 已移除）
+        local result=$(kubectl exec -n "$NAMESPACE" deploy/user-service -- nslookup "$svc.$NAMESPACE.svc.cluster.local" 2>/dev/null | grep -c "Address" || echo "0")
         if [ "$result" -gt 1 ]; then
             pass_test "DNS 解析 '$svc' 成功"
         else
@@ -337,7 +336,7 @@ main() {
     echo ""
     test_keycloak_admin
 
-    # DNS 測試 (可選，需要 gateway pod 運行)
+    # DNS 測試 (可選，需要 user-service pod 運行)
     # echo ""
     # test_internal_dns
 

@@ -24,9 +24,6 @@ import org.springframework.security.oauth2.jwt.JwtDecoders;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
 import org.springframework.security.web.SecurityFilterChain;
-import org.springframework.web.cors.CorsConfiguration;
-import org.springframework.web.cors.CorsConfigurationSource;
-import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
 import java.util.*;
 import java.util.stream.Collectors;
@@ -37,7 +34,6 @@ import java.util.stream.Collectors;
  * <p>Provides:</p>
  * <ul>
  *   <li>OAuth2 Resource Server with JWT validation (North-South security)</li>
- *   <li>CORS configuration</li>
  *   <li>Method-level security (@PreAuthorize)</li>
  *   <li>Role extraction from Keycloak JWT tokens</li>
  * </ul>
@@ -87,9 +83,6 @@ public class SecurityAutoConfiguration {
                 // Disable CSRF for stateless API
                 .csrf(AbstractHttpConfigurer::disable)
 
-                // Configure CORS
-                .cors(cors -> cors.configurationSource(corsConfigurationSource()))
-
                 // Stateless session management
                 .sessionManagement(session ->
                     session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
@@ -133,25 +126,6 @@ public class SecurityAutoConfiguration {
             return converter;
         }
 
-        @Bean
-        @ConditionalOnMissingBean
-        public CorsConfigurationSource corsConfigurationSource() {
-            SecurityProperties.CorsProperties corsProps = properties.getCors();
-
-            CorsConfiguration configuration = new CorsConfiguration();
-            configuration.setAllowedOrigins(corsProps.getAllowedOrigins());
-            configuration.setAllowedMethods(corsProps.getAllowedMethods());
-            configuration.setAllowedHeaders(corsProps.getAllowedHeaders());
-            configuration.setExposedHeaders(corsProps.getExposedHeaders());
-            configuration.setAllowCredentials(corsProps.isAllowCredentials());
-            configuration.setMaxAge(corsProps.getMaxAge());
-
-            UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
-            source.registerCorsConfiguration("/**", configuration);
-
-            log.info("CORS configured with allowed origins: {}", corsProps.getAllowedOrigins());
-            return source;
-        }
     }
 
     /**
@@ -181,7 +155,6 @@ public class SecurityAutoConfiguration {
 
             http
                 .csrf(AbstractHttpConfigurer::disable)
-                .cors(cors -> cors.configurationSource(corsConfigurationSource()))
                 .sessionManagement(session ->
                     session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
@@ -191,23 +164,6 @@ public class SecurityAutoConfiguration {
             return http.build();
         }
 
-        @Bean
-        @ConditionalOnMissingBean
-        public CorsConfigurationSource corsConfigurationSource() {
-            SecurityProperties.CorsProperties corsProps = properties.getCors();
-
-            CorsConfiguration configuration = new CorsConfiguration();
-            configuration.setAllowedOrigins(corsProps.getAllowedOrigins());
-            configuration.setAllowedMethods(corsProps.getAllowedMethods());
-            configuration.setAllowedHeaders(corsProps.getAllowedHeaders());
-            configuration.setExposedHeaders(corsProps.getExposedHeaders());
-            configuration.setAllowCredentials(corsProps.isAllowCredentials());
-            configuration.setMaxAge(corsProps.getMaxAge());
-
-            UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
-            source.registerCorsConfiguration("/**", configuration);
-            return source;
-        }
     }
 
     /**

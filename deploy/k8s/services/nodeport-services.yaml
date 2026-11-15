@@ -1,21 +1,5 @@
 # NodePort Services for external access in Kind
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: gateway-nodeport
-  namespace: rbac-sso
-  labels:
-    app: gateway
-spec:
-  type: NodePort
-  ports:
-    - port: 8080
-      targetPort: 8080
-      nodePort: 30080
-      name: http
-  selector:
-    app: gateway
+# (gateway-nodeport removed: Spring Cloud Gateway was dropped; call services directly on 8081/8082)
 ---
 apiVersion: v1
 kind: Service

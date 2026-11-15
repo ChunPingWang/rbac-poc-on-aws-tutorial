@@ -21,12 +21,9 @@ import java.util.List;
  *       - secret
  * }</pre>
  *
- * <p>To enable dynamic configuration reload, use with @RefreshScope:</p>
- * <pre>{@code
- * @RefreshScope
- * @ConfigurationProperties(prefix = "audit")
- * public class AuditProperties { ... }
- * }</pre>
+ * <p>Configuration is bound at startup. (Dynamic reload via Spring Cloud
+ * {@code @RefreshScope} was dropped together with the Spring Cloud dependencies;
+ * on AWS, change settings by redeploying the ECS task definition.)</p>
  */
 @ConfigurationProperties(prefix = "audit")
 public class AuditProperties {

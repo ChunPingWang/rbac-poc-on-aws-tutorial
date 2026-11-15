@@ -50,10 +50,8 @@ import java.util.List;
  *   service-name: my-service
  * </pre>
  *
- * <p>Dynamic configuration reload is supported via Spring Cloud Config or
- * Spring Boot Actuator's /actuator/refresh endpoint. When AuditProperties
- * is annotated with @RefreshScope, configuration changes will be picked up
- * at runtime without restart.</p>
+ * <p>Configuration is read at startup; this library no longer depends on
+ * Spring Cloud ({@code @RefreshScope} / Spring Cloud Config were removed).</p>
  *
  * <p>This configuration supports two audit mechanisms:</p>
  * <ul>

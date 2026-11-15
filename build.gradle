@@ -19,7 +19,6 @@ subprojects {
     apply plugin: 'jacoco'
 
     ext {
-        springCloudVersion = '2023.0.3'
         springDocVersion = '2.5.0'
         cucumberVersion = '7.18.0'
         testcontainersVersion = '1.19.8'
@@ -54,12 +53,7 @@ configure(subprojects.findAll {
 }) {
     apply plugin: 'org.springframework.boot'
     apply plugin: 'io.spring.dependency-management'
-
-    dependencyManagement {
-        imports {
-            mavenBom "org.springframework.cloud:spring-cloud-dependencies:${springCloudVersion}"
-        }
-    }
+    // 版本由 Spring Boot BOM 管理；已移除 Spring Cloud BOM（不再使用任何 Spring Cloud 元件）
 }
 
 // 根專案測試覆蓋率彙總

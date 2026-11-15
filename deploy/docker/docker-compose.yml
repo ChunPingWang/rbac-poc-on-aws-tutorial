@@ -106,31 +106,10 @@ services:
       start_period: 120s
 
   # ============================================================
-  # Gateway Service - API Gateway
+  # （已移除）Gateway Service - Spring Cloud Gateway
+  # 本版移除所有 Spring Cloud 元件；AWS 上由 Amazon API Gateway 取代。
+  # 本機 / Docker 環境請直接呼叫各服務：product-service :8081、user-service :8082
   # ============================================================
-  gateway:
-    build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile.gateway
-    container_name: rbac-gateway
-    environment:
-      SPRING_PROFILES_ACTIVE: docker
-      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/ecommerce
-      USER_SERVICE_URL: http://user-service:8081
-      PRODUCT_SERVICE_URL: http://product-service:8082
-    ports:
-      - "8080:8080"
-    depends_on:
-      keycloak:
-        condition: service_healthy
-    networks:
-      - rbac-network
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/actuator/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 60s
 
   # ============================================================
   # User Service - 使用者管理服務

@@ -3,10 +3,11 @@ Description: >
   rbac-poc-on-aws / 60 - API. Amazon API Gateway HTTP API replaces Spring Cloud Gateway:
   Cognito JWT authorizer (north-south authN at the edge), throttling, access logs,
   private integration to the internal ALB through a VPC Link.
+  No CORS: this POC has no browser front-end (clients are curl / scripts). If a SPA on
+  another origin is added later, add CorsConfiguration to the Api resource.
 
 Parameters:
   ProjectName: { Type: String, Default: rbac-poc }
-  CorsOrigin: { Type: String, Default: 'http://localhost:3000' }
 
 Resources:
   Api:
@@ -15,11 +16,6 @@ Resources:
       Name: !Sub '${ProjectName}-api'
       ProtocolType: HTTP
       DisableExecuteApiEndpoint: false
-      CorsConfiguration:
-        AllowOrigins: [!Ref CorsOrigin]
-        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
-        AllowHeaders: [Authorization, Content-Type, X-Correlation-ID]
-        MaxAge: 3600
       Tags: { Project: !Ref ProjectName }
 
   VpcLink:

@@ -12,10 +12,6 @@ nodes:
           kubeletExtraArgs:
             node-labels: "ingress-ready=true"
     extraPortMappings:
-      # Gateway Service
-      - containerPort: 30080
-        hostPort: 8080
-        protocol: TCP
       # Product Service
       - containerPort: 30081
         hostPort: 8081
