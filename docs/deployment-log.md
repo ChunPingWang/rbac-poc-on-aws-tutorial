@@ -26,3 +26,4 @@
 | 13:02–13:12 | deployer | `99-cleanup.sh`（60→10） | 全部刪除（約 10 分鐘）。殘留：bootstrap stack（IAM，免費）、artifact S3 bucket、兩個由 AWS 服務自行建立的 log group（RDS、Container Insights，0 bytes）→ 需 poc-admin 執行 `--all` | 26 |
 | 13:21–13:23 | poc-admin | `99-cleanup.sh --all` + 最終檢查 | bucket、2 個 log group、bootstrap 刪除；所有資源類別檢查皆為空 | 27 |
 | 13:xx（驗證後） | — | 文件與設定一致性修正 | `00-bootstrap-iam.yaml` 新增 `rbac-poc-admin-force-mfa`（強制 poc-admin 使用 MFA）、`00-bootstrap-iam.sh` 檢查呼叫者 MFA；**僅 cfn-lint 驗證，未重新部署** | |
+| 2026-11-15 | poc-admin（CloudShell，無 AWS 資源） | 移除 Spring Cloud 元件與 CORS 後執行全部模組測試 | Corretto 17：350 tests / 0 failures（含 6 項改寫的契約測試、18 個 Cucumber 場景）；部署腳本僅語法檢查 | 28 |

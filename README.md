@@ -2,7 +2,7 @@
 
 > 本 repo 由 [ChunPingWang/rbac-sso-poc](https://github.com/ChunPingWang/rbac-sso-poc)（Keycloak + OpenLDAP + Spring Cloud Gateway + Kind/K8s）延伸而來，
 > 把開源元件替換為 AWS 技術棧、實際部署到 AWS 帳號、以自動化腳本驗證 RBAC / 多租戶 / 稽核行為，並在驗證後清除所有計費資源。
-> **原專案的全部程式碼、腳本、K8s / Docker 部署檔都保留**，原始文件移至 [`docs/original/`](docs/original/)。
+> 原專案的程式碼、腳本、K8s / Docker 部署檔都保留，**唯一例外是 Spring Cloud 元件**：已依 [§1.3](#13-移除-spring-cloud-元件與-cors2026-11-15) 移除並改寫相關部署。原始文件移至 [`docs/original/`](docs/original/)。
 
 ## 成果摘要
 
@@ -13,7 +13,7 @@
 | 端到端驗證（`aws/scripts/50-verify.sh`） | **52 passed, 0 failed, 1 skipped**（詳見 [驗證報告](docs/verify-report.md)） |
 | 修正原專案既有缺陷 | 4 項（F1 跨租戶 by-id 存取、F2 缺少例外處理器導致 500、F3 gradle-wrapper.jar 未進版控、F5 `@EnableJpaRepositories` 讓 22 個 Controller 測試失敗），見 [§1.2](#12-評估時發現的問題已在本-repo-修正) |
 | 部署過程踩到並修正的問題 | 12 項，全部記錄在 [§10](#10-疑難排解實際踩到的坑) 與 [`docs/deployment-log.md`](docs/deployment-log.md) |
-| 截圖 | 29 張，位於 [`docs/images/`](docs/images/) |
+| 截圖 | 30 張，位於 [`docs/images/`](docs/images/) |
 | 計費資源 | 驗證完成後**全部清除並逐項確認為空**（2026-11-12 13:23 UTC，見 [§12.1](#121-本次實際清除結果2026-11-12)） |
 
 
@@ -22,6 +22,7 @@
 ## 目錄
 
 1. [專案評估：原架構盤點與發現](#1-專案評估原架構盤點與發現)
+   - [1.3 移除 Spring Cloud 元件與 CORS](#13-移除-spring-cloud-元件與-cors2026-11-15)
 2. [開源元件 → AWS 服務對照與選型理由](#2-開源元件--aws-服務對照與選型理由)
    - [2.1 AWS 服務詳解](#21-aws-服務詳解)（IAM、CloudFormation、CloudShell、VPC、Cognito、Lambda、API Gateway、ALB、ECS/Fargate、ECR、CodeBuild、S3、RDS、Secrets Manager、CloudWatch）
 3. [目標架構](#3-目標架構)
@@ -68,6 +69,56 @@
 
 
 
+### 1.3 移除 Spring Cloud 元件與 CORS（2026-11-15）
+
+AWS 版本已由 Amazon API Gateway 取代 Spring Cloud Gateway，因此把整個專案中的 Spring Cloud 相依全部移除，並一併拿掉不需要的 CORS 設定。
+
+| 原元件 | 用途 | 處理方式 |
+|---|---|---|
+| `services/gateway-service`（Spring Cloud Gateway） | 本機 / Docker / K8s 的 API 入口（:8080），路由到 product / user | **刪除模組**。AWS 上由 API Gateway HTTP API 取代；本機 / Docker / K8s 改為**直接呼叫** product-service（:8081）與 user-service（:8082） |
+| Spring Cloud BOM（`spring-cloud-dependencies`） | 管理 Spring Cloud 版本 | 自根 `build.gradle` 與 `audit-lib` 移除，版本只由 Spring Boot BOM 管理 |
+| Spring Cloud Contract（`audit-lib`） | 6 份 Groovy 契約自動產生稽核查詢 API 測試、發佈 WireMock stub | 改寫為一般 MockMvc 測試 `AuditQueryApiContractTest`，**保留同樣 6 個情境與斷言**；不再發佈 stub jar |
+| `spring-cloud-context`（`@RefreshScope`） | 只出現在註解說明，程式未實際使用 | 移除相依並更新註解 |
+| CORS：API Gateway `CorsConfiguration` | 允許 `http://localhost:3000` 跨來源呼叫 | 移除（`60-api.yaml` 的 `CorsOrigin` 參數一併移除）；未來若有 SPA 前端再加回 |
+| CORS：`audit-lib` 的 `corsConfigurationSource` 與 `audit.security.cors.*` 屬性 | 目前設定下不會啟用（security-lib 已提供 SecurityFilterChain） | 移除程式與屬性 |
+| CORS：Spring Cloud Gateway `globalcors` | gateway 的跨來源設定 | 隨 gateway-service 一起移除 |
+
+**受影響的部署檔（已改寫）**
+
+| 檔案 | 變更 |
+|---|---|
+| `deploy/docker/docker-compose.yml`、`Dockerfile.gateway` | 移除 gateway 服務與 Dockerfile |
+| `deploy/k8s/services/gateway.yaml`、`services-mtls/gateway-mtls.yaml` | 刪除 |
+| `deploy/k8s/services/nodeport-services.yaml`、`kind-config.yaml`、`scripts/start-k8s.sh` | 移除 gateway NodePort（30080 → 8080） |
+| `deploy/k8s/security/cert-manager/service-certificates.yaml` | 移除 gateway 憑證 |
+| `deploy/scripts/k8s-mtls-deploy.sh` | mTLS 連線測試改從 **user-service Pod** 發起（同樣掛載 CA 與自身憑證）；順便修正原本指向不存在的 `services/*/Dockerfile` 路徑 |
+| `deploy/scripts/k8s-deploy.sh`、`k8s-integration-test.sh`、`integration-test.sh`、`start-docker.sh`、`start-local.sh` | 移除 gateway 的建置、部署、健康檢查；整合測試改為「服務直連」檢查 |
+| `deploy/scripts/load-test.sh` | 以 `--product-url` / `--user-url`（`PRODUCT_URL` / `USER_URL`）取代 `--gateway`，依路徑自動選擇服務 |
+| `docs/tutorials/SPRING_CLOUD_GATEWAY_TUTORIAL.md` | 移至 `docs/original/` 作為歷史參考 |
+
+**影響與取捨**
+- **AWS 版本不受影響**：本來就不部署 gateway-service；`60-api.yaml` 只少了 CORS 設定。
+- **本機 / Docker / K8s 失去統一入口與邊界 JWT 驗證**：各服務本身仍以 Spring Security 驗證 JWT 並做 RBAC，安全性不變；只是用戶端要分別呼叫 8081 / 8082。若需要本機統一入口，可改用不屬於 Spring Cloud 的反向代理（例如 Nginx、Envoy）。
+- **瀏覽器前端**：沒有 CORS 時，不同來源的瀏覽器頁面無法直接呼叫 API；正式導入 SPA 時請在 API Gateway 加回 `CorsConfiguration`，並只允許實際的前端網域。
+
+**驗證結果（2026-11-15，CloudShell，Amazon Corretto 17，`./gradlew test --continue`，全部模組）**
+
+| 模組 | 測試數 | 失敗 |
+|---|---:|---:|
+| `libs/audit-lib`（含改寫後的 `AuditQueryApiContractTest` 6 項） | 166 | 0 |
+| `libs/security-lib` | 7 | 0 |
+| `services/product-service` | 128 | 0 |
+| `services/user-service` | 9 | 0 |
+| `apps/rbac-demo` | 22 | 0 |
+| `tests/scenario-tests`（Cucumber BDD 場景） | 18 | 0 |
+| **合計** | **350** | **0** |
+
+![移除 Spring Cloud 後全部測試通過](docs/images/28-remove-spring-cloud-all-tests.jpg)
+
+> 這次是在 CloudShell 執行**全部模組**的測試（先前 CodeBuild 只跑 AWS 部署相關的 4 個模組，144 項）。
+> **未驗證**：Docker Compose、Kind/K8s、mTLS 等改寫後的部署腳本只做了 `bash -n` 語法檢查與 YAML 解析，**尚未實際執行**；AWS 端也未重新部署（`60-api.yaml` 只移除 CORS，已通過 `cfn-lint`）。
+
+
 ---
 
 ## 2. 開源元件 → AWS 服務對照與選型理由
@@ -85,7 +136,7 @@
 | Docker build / registry | **AWS CodeBuild + Amazon ECR** | 在 AWS 內跑單元測試 → 打包 → 建 image；ECR 不可變 tag + 推送即掃描 |
 | docker logs / kubectl logs | **Amazon CloudWatch Logs**、Container Insights、VPC Flow Logs | |
 | cert-manager mTLS（東西向） | **未部署**（見 [§13.1](#131-東西向-mtls-與-aws-private-ca-的替代方案)） | AWS Private CA 一般模式 US$400 / CA / 月、short-lived 模式 US$50 / CA / 月；POC 以 Security Group 鏈 + 私有子網路取代 |
-| Spring Cloud Gateway 的 CORS | API Gateway `CorsConfiguration` | |
+| Spring Cloud Gateway 的 CORS | **移除**（見 [§1.3](#13-移除-spring-cloud-元件與-cors2026-11-15)） | 本 POC 沒有瀏覽器前端，用戶端都是 curl / 腳本，不需要 CORS |
 
 ### 2.1 AWS 服務詳解
 
@@ -1351,9 +1402,9 @@ rbac-poc-on-aws-tutorial/
 │   ├── verify-report.md           ← 驗證報告（自動產生）
 │   └── original/                  ← 原專案 README / PRD / TECH / INFRA
 ├── libs/                          security-lib / tenant-lib / audit-lib / common-lib
-├── services/                      product-service / user-service / gateway-service（保留）
+├── services/                      product-service / user-service（gateway-service 已移除，見 §1.3）
 ├── apps/rbac-demo/                （保留）
-├── deploy/                        docker / k8s / scripts（原專案，全部保留）
+├── deploy/                        docker / k8s / scripts（原專案；已移除 gateway 相關設定）
 ├── specs/                         原專案 spec-kit
 └── tests/scenario-tests/          Cucumber BDD（保留）
 ```
