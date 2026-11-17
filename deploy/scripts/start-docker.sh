@@ -174,8 +174,8 @@ show_status() {
     echo -e "\n${BLUE}=== 存取資訊 ===${NC}"
     echo "Keycloak Admin:    http://localhost:8180 (admin / admin123)"
     echo "phpLDAPadmin:      http://localhost:8181"
-    echo "User Service:      http://localhost:8081"
-    echo "Product Service:   http://localhost:8082"
+    echo "Product Service:   http://localhost:8081"
+    echo "User Service:      http://localhost:8082"
 }
 
 # 顯示日誌

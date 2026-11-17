@@ -218,13 +218,29 @@ verify_mtls() {
     log_info "從 User Service Pod 測試 mTLS 連線到 Product Service..."
 
     # 使用 curl 測試 mTLS 連線
-    kubectl exec -n $NAMESPACE "$CLIENT_POD" -- \
-        curl -v --cacert /etc/ssl/certs/ca.crt \
+    # 服務埠 8081 走 mTLS，且業務端點需要 JWT；健康檢查放在管理埠 8091（HTTP）。
+    # 因此「帶 client 憑證」預期：TLS 握手成功，並收到應用程式的 HTTP 回應（未帶 JWT → 401）。
+    local out code_with code_without
+    out=$(kubectl exec -n $NAMESPACE "$CLIENT_POD" -- \
+        curl -sv -o /dev/null -w "HTTP_CODE=%{http_code}" --cacert /etc/ssl/certs/ca.crt \
              --cert /etc/ssl/certs/tls.crt \
              --key /etc/ssl/certs/tls.key \
-             https://product-service:8081/actuator/health 2>&1 | grep -E "(SSL|TLS|HTTP)" || true
+             https://product-service:8081/api/products 2>&1)
+    echo "$out" | grep -E "(SSL connection|Request CERT|HTTP_CODE)" || true
+    code_with=$(echo "$out" | grep -oE 'HTTP_CODE=[0-9]+' | cut -d= -f2)
 
-    log_info "mTLS 驗證完成"
+    # 反向驗證：不帶 client 憑證應在 TLS 握手階段被拒（curl 回 000），證明是 mutual TLS
+    code_without=$(kubectl exec -n $NAMESPACE "$CLIENT_POD" -- \
+        curl -s -o /dev/null -w "%{http_code}" --cacert /etc/ssl/certs/ca.crt \
+             https://product-service:8081/api/products 2>/dev/null || true)
+
+    if echo "$out" | grep -q "SSL connection using" && [ -n "$code_with" ] && [ "$code_with" != "000" ] \
+       && [ "${code_without:-000}" = "000" ]; then
+        log_info "mTLS 驗證通過：帶 client 憑證 → TLS 握手成功、應用程式回 HTTP ${code_with}；不帶 client 憑證 → 握手被拒（${code_without:-000}）"
+    else
+        log_error "mTLS 驗證失敗（帶憑證：${code_with:-無回應}；不帶憑證：${code_without:-無回應}）"
+        return 1
+    fi
 }
 
 # 顯示部署狀態
