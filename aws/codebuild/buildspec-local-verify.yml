@@ -1,0 +1,57 @@
+# =====================================================================
+# CodeBuild (buildspec override): 驗證「非 AWS」部署路徑
+#   A. Docker Compose  : start-docker.sh start → integration-test.sh
+#   B. Kind / K8s      : k8s-deploy.sh --build → k8s-integration-test.sh
+#   C. Kind + mTLS     : k8s-mtls-deploy.sh --install-cert-manager --verify
+# 在 AWS 內執行的原因：CodeBuild privileged 模式內建 Docker daemon，
+# 7 GB RAM / 4 vCPU，可同時跑 Keycloak + LDAP + PostgreSQL + 2 個服務。
+# 由 aws/scripts/25-verify-local-envs.sh 以 --buildspec-override 啟動，不推送任何 image。
+# =====================================================================
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx1g"
+    KIND_VERSION: "v0.24.0"
+    KUBECTL_VERSION: "v1.31.2"
+
+phases:
+  install:
+    runtime-versions:
+      java: corretto17
+    commands:
+      - curl -fsSLo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64" && chmod +x /usr/local/bin/kind
+      - curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" && chmod +x /usr/local/bin/kubectl
+      - docker compose version || { mkdir -p /usr/local/lib/docker/cli-plugins && curl -fsSLo /usr/local/lib/docker/cli-plugins/docker-compose https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64 && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose; }
+      - kind version && kubectl version --client && docker compose version
+      - chmod +x ./gradlew deploy/scripts/*.sh
+      # Docker Hub 匿名拉取在共用 IP 容易被限流：官方映像改由 ECR Public 鏡像拉取後 retag
+      - |
+        pull() { # pull <docker.io 名稱> [ECR Public 鏡像]
+          for i in 1 2 3; do docker pull -q "$1" && return 0; [ -n "${2:-}" ] && docker pull -q "$2" && docker tag "$2" "$1" && return 0; sleep 15; done; return 1; }
+        pull postgres:15-alpine            public.ecr.aws/docker/library/postgres:15-alpine
+        pull eclipse-temurin:17-jre-jammy  public.ecr.aws/docker/library/eclipse-temurin:17-jre-jammy
+        pull osixia/openldap:1.5.0
+        pull osixia/phpldapadmin:0.9.0
+        pull quay.io/keycloak/keycloak:24.0
+  build:
+    commands:
+      - echo "=== A. Docker Compose ==="
+      - ./deploy/scripts/start-docker.sh start
+      - |
+        ./deploy/scripts/integration-test.sh 2>&1 | tee /tmp/A.log; test ${PIPESTATUS[0]} -eq 0 && echo "VERIFY SUMMARY A docker-compose PASS $(grep -aoP '通過: (\e\[[0-9;]*m)?\K[0-9]+' /tmp/A.log | tail -1) checks" || { echo "VERIFY SUMMARY A docker-compose FAIL"; docker ps -a; docker logs --tail 80 rbac-product-service || true; exit 1; }
+      - ./deploy/scripts/start-docker.sh clean
+      - echo "=== B. Kind / K8s ==="
+      - kind create cluster --config deploy/k8s/kind-config.yaml --name rbac-sso --wait 120s
+      - for img in postgres:15-alpine osixia/openldap:1.5.0 quay.io/keycloak/keycloak:24.0; do kind load docker-image "$img" --name rbac-sso; done
+      - ./deploy/scripts/k8s-deploy.sh --build
+      - |
+        ./deploy/scripts/k8s-integration-test.sh 2>&1 | tee /tmp/B.log; test ${PIPESTATUS[0]} -eq 0 && echo "VERIFY SUMMARY B kind-k8s PASS $(grep -aoP '通過: (\e\[[0-9;]*m)?\K[0-9]+' /tmp/B.log | tail -1) checks" || { echo "VERIFY SUMMARY B kind-k8s FAIL"; kubectl get pods -n rbac-sso -o wide; exit 1; }
+      - echo "=== C. Kind + cert-manager mTLS ==="
+      - kubectl delete -n rbac-sso deploy/product-service deploy/user-service --ignore-not-found
+      - |
+        ./deploy/scripts/k8s-mtls-deploy.sh --install-cert-manager --verify 2>&1 | tee /tmp/C.log; test ${PIPESTATUS[0]} -eq 0 && echo "VERIFY SUMMARY C kind-mtls PASS" || { echo "VERIFY SUMMARY C kind-mtls FAIL"; kubectl get pods,certificates -n rbac-sso; kubectl logs -n rbac-sso -l app=product-service --tail 60 || true; exit 1; }
+  post_build:
+    commands:
+      - kind delete cluster --name rbac-sso || true
