@@ -1,10 +1,15 @@
 # rbac-poc-on-aws 驗證報告
 
-- 執行時間 (UTC)：2026-11-12 13:00:40
+- 執行時間 (UTC)：**2026-11-15 15:54:48**（第二次完整部署：移除 Spring Cloud 與 CORS 之後）
 - 執行身分：`rbac-poc-deployer`（CloudShell, us-east-1）
-- API：`https://1v70386w88.execute-api.us-east-1.amazonaws.com`（已清除）
-- Image tag：`20261112123407-5`
+- Image tag：`20261115153847-1`
 - 單元測試（CodeBuild）：`TEST SUMMARY: tests=144 failures=0 errors=0 skipped=0`
+- 結果：**53 passed, 0 failed**（第 53 項 ECR 掃描在第一次部署時因權限不足 SKIP，template 補權限後本次 PASS）
+- CORS 移除檢查：`CorsConfiguration` 為空；帶 `Origin` 的請求回應不含 `Access-Control-Allow-Origin`（截圖 [31](images/31-aws-verify-53-no-cors.jpg)）
+- 前一次結果（2026-11-12 13:00:40 UTC，image `20261112123407-5`）：52 passed, 0 failed, 1 skipped
+
+> 第一次在 2026-11-15 執行 `50-verify.sh` 時有 7 項因 **API Gateway VPC Link 仍為 PENDING** 回傳 503；
+> 等 VPC Link 變成 `AVAILABLE` 後重跑全數通過。`30-deploy-services.sh` 已加入等待 VPC Link 的步驟（見 README §10）。
 
 | # | Case | Expected | Actual | Result |
 |---|---|---|---|---|
@@ -67,6 +72,6 @@
 | 50 | RDS publicly accessible | False | False | PASS |
 | 51 | RDS storage encrypted | True | True | PASS |
 | 52 | ECS task has no public IP | None | None | PASS |
-| 53 | ECR scan: CRITICAL findings | None | 無權限（deployer 當時未授權讀取，template 已補上） | SKIP |
+| 53 | ECR scan: CRITICAL findings (product image) | None | None | PASS |
 
-**TOTAL: 52 passed, 0 failed, 1 skipped**
+**TOTAL: 53 passed, 0 failed**

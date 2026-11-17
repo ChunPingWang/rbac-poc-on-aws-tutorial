@@ -27,3 +27,10 @@
 | 13:21–13:23 | poc-admin | `99-cleanup.sh --all` + 最終檢查 | bucket、2 個 log group、bootstrap 刪除；所有資源類別檢查皆為空 | 27 |
 | 13:xx（驗證後） | — | 文件與設定一致性修正 | `00-bootstrap-iam.yaml` 新增 `rbac-poc-admin-force-mfa`（強制 poc-admin 使用 MFA）、`00-bootstrap-iam.sh` 檢查呼叫者 MFA；**僅 cfn-lint 驗證，未重新部署** | |
 | 2026-11-15 | poc-admin（CloudShell，無 AWS 資源） | 移除 Spring Cloud 元件與 CORS 後執行全部模組測試 | Corretto 17：350 tests / 0 failures（含 6 項改寫的契約測試、18 個 Cucumber 場景）；部署腳本僅語法檢查 | 28 |
+| 2026-11-15 15:15–15:21 | poc-admin | `00-bootstrap-iam.sh`（含強制 MFA 的新版 template） | 輸出 `AdminMfaEnforcedFor = poc-admin`；`simulate-principal-policy`：MFA=true → allowed、MFA=false → explicitDeny | 29, 30 |
+| 2026-11-15 15:24–15:49 | deployer | `deploy-all.sh`（第二次完整部署，已移除 Spring Cloud / CORS） | foundation → CodeBuild（144 tests / 0 failures，image `20261115153847-1`）→ 50-services；途中 CloudShell 工作階段重置使前景腳本中斷（stack 已完成），改用 `nohup` 續跑 30 → 40 → 50 | |
+| 2026-11-15 15:52 | deployer | `50-verify.sh` 第一次 | 46 pass / 7 fail：API Gateway 回 503，VPC Link 仍為 PENDING → `30-deploy-services.sh` 加入等待 `AVAILABLE` | |
+| 2026-11-15 15:54 | deployer | `50-verify.sh` 第二次 | **53 passed, 0 failed**；`CorsConfiguration` 為空、回應無 `Access-Control-Allow-Origin` | 31 |
+| 2026-11-15 15:55–16:03 | deployer | `25-verify-local-envs.sh` 第一次 | Docker Compose 15/15、Kind 31/31 通過；mTLS 檢查失敗：帶憑證打 `:8081/actuator/health` 回 401（健康檢查在管理埠 8091，8081 需 JWT；握手其實成功）→ 修正檢查邏輯 | |
+| 2026-11-15 16:07 | deployer | `25-verify-local-envs.sh` 第二次 | CodeBuild `DOWNLOAD_SOURCE` 失敗：buildspec 指令含 `通過: ` 被 YAML 解析成 mapping → 改用區塊字串 | |
+| 2026-11-15 16:12–16:22 | deployer | `25-verify-local-envs.sh` 第三次 | **Docker Compose 15/15、Kind 31/31、Kind+mTLS 通過**（帶憑證 → TLS 1.3 握手、HTTP 401；不帶憑證 → 000） | 32 |
