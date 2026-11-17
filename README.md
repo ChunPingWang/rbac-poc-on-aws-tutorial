@@ -10,10 +10,12 @@
 |---|---|
 | 部署環境 | AWS 帳號（us-east-1），全程透過 Console + CloudShell，部署者為最小權限 IAM User `rbac-poc-deployer` |
 | 單元測試（在 AWS CodeBuild 執行） | **144 tests, 0 failures** |
-| 端到端驗證（`aws/scripts/50-verify.sh`） | **52 passed, 0 failed, 1 skipped**（詳見 [驗證報告](docs/verify-report.md)） |
+| 端到端驗證（`aws/scripts/50-verify.sh`） | **53 passed, 0 failed**（2026-11-15 第二次完整部署；第一次 2026-11-12 為 52 passed / 1 skipped，詳見 [驗證報告](docs/verify-report.md)） |
+| 全部模組測試（移除 Spring Cloud 後） | **350 tests, 0 failures**（見 [§1.3](#13-移除-spring-cloud-元件與-cors2026-11-15)） |
+| 非 AWS 部署路徑（在 CodeBuild 實際執行） | Docker Compose **15/15**、Kind **31/31**、Kind + cert-manager mTLS **通過**（見 [§3.0.2](#302-部署拓樸與驗證狀態)） |
 | 修正原專案既有缺陷 | 4 項（F1 跨租戶 by-id 存取、F2 缺少例外處理器導致 500、F3 gradle-wrapper.jar 未進版控、F5 `@EnableJpaRepositories` 讓 22 個 Controller 測試失敗），見 [§1.2](#12-評估時發現的問題已在本-repo-修正) |
-| 部署過程踩到並修正的問題 | 12 項，全部記錄在 [§10](#10-疑難排解實際踩到的坑) 與 [`docs/deployment-log.md`](docs/deployment-log.md) |
-| 截圖 | 30 張，位於 [`docs/images/`](docs/images/) |
+| 部署過程踩到並修正的問題 | 17 項，全部記錄在 [§10](#10-疑難排解實際踩到的坑) 與 [`docs/deployment-log.md`](docs/deployment-log.md) |
+| 截圖 | 34 張，位於 [`docs/images/`](docs/images/) |
 | 計費資源 | 驗證完成後**全部清除並逐項確認為空**（2026-11-12 13:23 UTC，見 [§12.1](#121-本次實際清除結果2026-11-12)） |
 
 
@@ -25,7 +27,9 @@
    - [1.3 移除 Spring Cloud 元件與 CORS](#13-移除-spring-cloud-元件與-cors2026-11-15)
 2. [開源元件 → AWS 服務對照與選型理由](#2-開源元件--aws-服務對照與選型理由)
    - [2.1 AWS 服務詳解](#21-aws-服務詳解)（IAM、CloudFormation、CloudShell、VPC、Cognito、Lambda、API Gateway、ALB、ECS/Fargate、ECR、CodeBuild、S3、RDS、Secrets Manager、CloudWatch）
+   - [2.2 Spring Cloud 與其他開源元件 → AWS 替代總表](#22-spring-cloud-與其他開源元件--aws-替代總表)
 3. [目標架構](#3-目標架構)
+   - [3.0 完整架構總覽](#30-完整架構總覽)（分層對照、5 種部署拓樸與驗證狀態、開源版拓樸）
 4. [身分、群組、角色、權限的關聯與目的](#4-身分群組角色權限的關聯與目的)
    - [4.0 帳號規劃與要求](#40-帳號規劃與要求)（帳號清單、為什麼要 MFA、強制機制、生命週期、收尾清單）
 5. [AWS 最佳實踐對照](#5-aws-最佳實踐對照)
@@ -116,7 +120,7 @@ AWS 版本已由 Amazon API Gateway 取代 Spring Cloud Gateway，因此把整�
 ![移除 Spring Cloud 後全部測試通過](docs/images/28-remove-spring-cloud-all-tests.jpg)
 
 > 這次是在 CloudShell 執行**全部模組**的測試（先前 CodeBuild 只跑 AWS 部署相關的 4 個模組，144 項）。
-> **未驗證**：Docker Compose、Kind/K8s、mTLS 等改寫後的部署腳本只做了 `bash -n` 語法檢查與 YAML 解析，**尚未實際執行**；AWS 端也未重新部署（`60-api.yaml` 只移除 CORS，已通過 `cfn-lint`）。
+> **2026-11-15 補做的實機驗證**：改寫後的部署腳本已實際執行——Docker Compose 15/15、Kind 31/31、Kind + cert-manager mTLS 通過（在 AWS CodeBuild 內執行，見 [§3.0.2](#302-部署拓樸與驗證狀態)）；AWS 端重新部署後 `50-verify.sh` **53/53 通過**，並確認 API Gateway 已無 `CorsConfiguration`、回應不帶 `Access-Control-Allow-Origin`（見 [§9](#9-驗證結果)）。
 
 
 ---
@@ -561,10 +565,162 @@ stateDiagram-v2
 - [AWS CloudShell FAQs](https://aws.amazon.com/cloudshell/faqs/)
 - [AWS Pricing Calculator](https://calculator.aws/)
 
+### 2.2 Spring Cloud 與其他開源元件 → AWS 替代總表
+
+§2 的表只列本 POC 實際替換的元件。本節把範圍擴大到**整個 Spring Cloud 家族與常見的開源平台元件**，說明 AWS 有沒有對應服務、能替代到什麼程度，以及本 POC 有沒有實際使用。
+
+**圖例**
+- 替代程度：**完整** = 功能可由 AWS 託管服務承接，應用程式只需改設定或改呼叫方式；**部分** = 主要功能可替代，但有一部分要留在程式內或改設計；**無對應** = 不是執行期元件或 AWS 沒有同類服務。
+- 本 POC：✅ 已採用並在 AWS 實際部署驗證；◻ 可行但本 POC 未使用；🔁 改寫為不依賴 Spring Cloud 的作法。
+
+#### 2.2.1 Spring Cloud 家族
+
+| Spring Cloud 元件 | 原本解決的問題 | AWS 對應服務 | 替代程度 | 本 POC | 說明 / 限制 |
+|---|---|---|---|---|---|
+| **Gateway** | API 統一入口、路由、JWT 驗證、限流 | **API Gateway HTTP API**（JWT Authorizer、節流、Access Log）＋ **內部 ALB**（path routing） | 完整 | ✅ | 路由、邊界驗證、節流全託管；需要自訂過濾器邏輯時改用 Lambda Authorizer 或留在服務內 |
+| Gateway 的 CORS（`globalcors`） | 瀏覽器跨來源呼叫 | API Gateway `CorsConfiguration` | 完整 | 🔁 移除 | 本 POC 沒有瀏覽器前端，見 [§1.3](#13-移除-spring-cloud-元件與-cors2026-11-15) |
+| **Config Server** ＋ `@RefreshScope` | 集中設定、不重啟更新設定 | **AWS AppConfig**（動態設定、Feature Flag、分段部署與自動回滾，可搭配 AppConfig Agent sidecar）、**SSM Parameter Store**（靜態設定） | 完整 | ◻ | 應用程式要改成從 AppConfig Agent 的 localhost 端點或 SDK 讀取；本 POC 設定由 ECS Task Definition 環境變數注入 |
+| **Vault**（Spring Cloud Vault） | 機敏資訊管理 | **Secrets Manager** | 完整 | ✅ | RDS 主帳密由 `ManageMasterUserPassword` 託管，ECS 啟動時以 `secrets` 注入，不落地、不進版控 |
+| **Netflix Eureka / Consul Discovery** | 服務註冊與發現 | **AWS Cloud Map**、**ECS Service Connect**；或以固定 DNS 的 ALB 取代 | 完整 | ✅（ALB） | 本 POC 只有 2 個服務，用內部 ALB 的 path routing 即可，不需要註冊中心 |
+| **LoadBalancer**（用戶端負載平衡） | 在呼叫端挑選實例 | **ALB / NLB**（伺服器端）、**ECS Service Connect**（每個 task 旁的 Envoy proxy） | 完整 | ✅（ALB） | 改成由平台負載平衡，程式不需知道實例清單 |
+| **OpenFeign** | 宣告式 HTTP 用戶端 | —（程式庫，不是基礎設施） | 無對應 | — | 服務間呼叫可改用 Spring 6 的 `RestClient` / HTTP Interface，目標指向 Service Connect 或 ALB 名稱 |
+| **Circuit Breaker**（Resilience4j 整合） | 斷路、逾時、重試、降級 | **ECS Service Connect** 的逾時、重試與 outlier detection；ALB 健康檢查 | 部分 | ◻ | 平台能隔離故障實例，但「降級回應（fallback）」屬業務邏輯，仍需直接使用 Resilience4j（不需 Spring Cloud） |
+| **Sleuth / Micrometer Tracing** | 分散式追蹤 | **AWS X-Ray** ＋ **AWS Distro for OpenTelemetry（ADOT）**、CloudWatch Application Signals | 完整 | ◻ | AWS 已公告 X-Ray SDK / Daemon 終止支援並建議改用 OpenTelemetry；新專案直接用 OpenTelemetry |
+| **Stream**（Kafka / RabbitMQ binder） | 事件驅動訊息 | **Amazon MSK**、**Amazon MQ**、**SNS / SQS**、**EventBridge**、**Kinesis** | 完整 | ◻ | 改用各服務的 SDK 或 Spring for Apache Kafka；不再需要 binder 抽象層 |
+| **Bus** | 廣播設定變更事件 | **AppConfig**（Agent 輪詢）、**EventBridge** | 完整 | ◻ | AppConfig 已內建推送與回滾，通常不需要再建事件匯流排 |
+| **Function** | 函式化程式模型 | **AWS Lambda** | 完整 | ✅（Node.js） | 本 POC 的 Cognito Pre Token Generation 就是 Lambda |
+| **Task / Data Flow** | 批次與資料管線 | **AWS Batch**、**Step Functions**、EventBridge Scheduler ＋ ECS Task | 完整 | ◻ | |
+| **Kubernetes**（Spring Cloud Kubernetes） | 從 ConfigMap / Secret 讀設定、K8s 服務發現 | ECS Task Definition 的 `environment` / `secrets`、Cloud Map | 完整 | ✅ | 改在 ECS 上就不需要這個元件 |
+| **Security**（TokenRelay 等） | 在 Gateway 轉送 OAuth2 token | **Cognito** ＋ API Gateway JWT Authorizer；服務本身用 Spring Security Resource Server | 完整 | ✅ | token 原封不動轉送到服務，服務再驗證一次（縱深防禦） |
+| **Contract** | 消費者驅動契約測試、WireMock stub | —（測試工具，不是執行期元件） | 無對應 | 🔁 | 本 POC 改寫為一般 MockMvc 測試 `AuditQueryApiContractTest`，6 個情境不變 |
+
+> **AWS App Mesh 已於 2026-09-30 終止支援**，不要再用它做服務網格；ECS 上的東西向流量請改用 **ECS Service Connect** 或 **Amazon VPC Lattice**（見 [§13.1](#131-東西向-mtls-與-aws-private-ca-的替代方案)）。
+
+#### 2.2.2 其他開源元件
+
+| 開源元件 | 用途 | AWS 對應服務 | 替代程度 | 本 POC | 說明 / 限制 |
+|---|---|---|---|---|---|
+| **OpenLDAP** ＋ phpLDAPadmin | 使用者 / 群組目錄與管理介面 | **Cognito User Pool**（Groups、`custom:tenant_id`）＋ Cognito Console | 完整 | ✅ | 若企業已有 AD，改用 Cognito 的 SAML / OIDC 聯合登入，或 AWS Directory Service |
+| **Keycloak**（OIDC / SSO、Realm Roles、Protocol Mapper） | 身分驗證、SSO、角色 | **Cognito**（Hosted UI、Groups、Pre Token Generation Lambda） | 部分 | ✅ | 登入、SSO、角色、token 客製化都可替代；Keycloak 的 Authorization Services（集中式授權政策）沒有對應功能，需要時可評估 **Amazon Verified Permissions**（Cedar 政策） |
+| **PostgreSQL**（Keycloak 用） | IdP 資料庫 | 不需要（Cognito 全託管） | 完整 | ✅ | |
+| **H2 / PostgreSQL**（服務資料） | 業務資料、稽核紀錄 | **RDS for PostgreSQL**（加密、強制 TLS、自動備份） | 完整 | ✅ | 兩個服務各用一個 schema：`product`、`user_service` |
+| **Docker Compose / Kind / K8s** | 容器編排 | **ECS on Fargate** | 完整 | ✅ | 需要 K8s API 或 Helm 生態系時改用 **Amazon EKS** |
+| **K8s Service / NodePort / Ingress** | 服務暴露與路由 | **ALB**（EKS 上用 AWS Load Balancer Controller） | 完整 | ✅ | |
+| **cert-manager** ＋ 自簽 CA（mTLS） | 東西向雙向 TLS | **AWS Private CA** ＋ ACM、ECS Service Connect TLS、VPC Lattice | 完整（成本高） | ◻ | AWS 上未部署，原因與替代方案見 [§13.1](#131-東西向-mtls-與-aws-private-ca-的替代方案)；Kind 環境的 cert-manager mTLS 仍保留並已驗證（見 [§3.0](#30-完整架構總覽)） |
+| **Docker Registry** | Image 倉庫 | **Amazon ECR**（不可變 tag、推送即掃描） | 完整 | ✅ | |
+| 開發機 Gradle ／ Jenkins ／ GitHub Actions | 建置、測試 | **CodeBuild**（＋ CodePipeline） | 完整 | ✅ | CodeBuild 用 IAM Role 推 ECR，不需長期金鑰 |
+| **Argo CD**（GitOps） | 宣告式持續部署 | **EKS Capability for Argo CD**（託管 Argo CD，限 EKS）；ECS 用 CodePipeline ＋ CodeDeploy（藍綠部署） | 完整 | ◻ | 本 POC 用 CloudFormation ＋ 腳本部署 |
+| **Prometheus / Grafana**（Actuator metrics） | 指標與儀表板 | **CloudWatch Container Insights**；**Amazon Managed Service for Prometheus**、**Amazon Managed Grafana** | 完整 | ✅（Container Insights） | |
+| `docker logs` ／ ELK | 日誌 | **CloudWatch Logs**；需要全文搜尋時用 **Amazon OpenSearch Service** | 完整 | ✅ | |
+| ——（新增） | AWS 層級的操作稽核 | **CloudTrail** | — | ✅ | 應用程式層稽核仍由 `audit-lib` 寫入 RDS |
+
+#### 2.2.3 AWS 取代不了、仍留在程式碼裡的部分
+
+| 能力 | 留在哪裡 | 原因 |
+|---|---|---|
+| 細粒度 RBAC（`@PreAuthorize`） | `security-lib` ＋ 各服務 | API Gateway 只驗證 token 是否有效，不知道「哪個角色能呼叫哪個方法」；外部化授權可評估 Verified Permissions |
+| 多租戶隔離 | `tenant-lib`、`TenantAccessGuard` | 租戶是業務概念，需在查詢與存取時檢查 |
+| 業務稽核紀錄 | `audit-lib`（AOP） | CloudTrail 只記錄 AWS API 呼叫，不記錄「誰刪了哪個商品」 |
+| 降級回應（fallback） | Resilience4j | 回傳什麼替代結果是業務決策 |
+
+#### 2.2.4 參考資料（2026-11 查證）
+
+- [Migrating from AWS App Mesh to Amazon ECS Service Connect](https://aws.amazon.com/blogs/containers/migrating-from-aws-app-mesh-to-amazon-ecs-service-connect)、[Migrating from AWS App Mesh to Amazon VPC Lattice](https://aws.amazon.com/blogs/containers/migrating-from-aws-app-mesh-to-amazon-vpc-lattice)
+- [What is AWS AppConfig?](https://docs.aws.amazon.com/appconfig/latest/userguide/what-is-appconfig.html)、[Implementing feature flags in container environments with AWS AppConfig](https://aws.amazon.com/blogs/containers/implementing-feature-flags-in-container-environments-with-aws-appconfig/)
+- [X-Ray SDK and daemon end of support timeline](https://docs.aws.amazon.com/xray/latest/devguide/xray-daemon-eos.html)
+- [Announcing Amazon EKS Capabilities（託管 Argo CD、ACK、kro）](https://aws.amazon.com/about-aws/whats-new/2025/11/amazon-eks-capabilities)、[Continuous Deployment with Argo CD - Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/argocd.html)
+- [Configuration management - Implementing Microservices on AWS](https://docs.aws.amazon.com/whitepapers/latest/microservices-on-aws/configuration-management.html)
+
 
 ---
 
 ## 3. 目標架構
+
+### 3.0 完整架構總覽
+
+#### 3.0.1 分層對照：同一套程式碼，兩種執行平台
+
+```mermaid
+flowchart TB
+    subgraph L1["① 用戶端"]
+        direction LR
+        C1["curl / 腳本 / 瀏覽器"]
+    end
+    subgraph L2["② 身分與 SSO"]
+        direction LR
+        O2["開源：OpenLDAP + Keycloak + PostgreSQL"]
+        A2["AWS：Cognito User Pool + Groups<br/>+ Pre Token Generation Lambda"]
+    end
+    subgraph L3["③ API 入口（南北向）"]
+        direction LR
+        O3["開源：直接呼叫 :8081 / :8082<br/>（Spring Cloud Gateway 已移除）"]
+        A3["AWS：API Gateway HTTP API<br/>JWT Authorizer → VPC Link → 內部 ALB"]
+    end
+    subgraph L4["④ 微服務（共用同一份程式碼與 image 內容）"]
+        direction LR
+        S4["product-service :8081 / user-service :8082<br/>security-lib・tenant-lib・audit-lib<br/>Spring Security Resource Server + @PreAuthorize"]
+    end
+    subgraph L5["⑤ 執行平台"]
+        direction LR
+        O5["開源：Docker Compose / Kind (K8s)"]
+        A5["AWS：ECS on Fargate（私有子網路）"]
+    end
+    subgraph L6["⑥ 資料"]
+        direction LR
+        O6["開源：H2（檔案）"]
+        A6["AWS：RDS PostgreSQL 16 + Secrets Manager"]
+    end
+    subgraph L7["⑦ 東西向安全"]
+        direction LR
+        O7["開源：cert-manager 自簽 CA + Spring SSL Bundle（mTLS）"]
+        A7["AWS：Security Group 鏈 + 私有子網路<br/>（mTLS 選項見 §13.1）"]
+    end
+    subgraph L8["⑧ 建置・部署・維運"]
+        direction LR
+        O8["開源：本機 Gradle + docker build / kind load"]
+        A8["AWS：CloudFormation + CodeBuild + ECR<br/>CloudWatch Logs / Container Insights / Flow Logs / CloudTrail"]
+    end
+    L1 --> L2 --> L3 --> L4 --> L5 --> L6
+    L4 -.-> L7
+    L8 -.-> L5
+```
+
+**設計重點**：微服務層（④）在所有平台都是同一份程式碼。角色轉換由 `CompositeRoleConverter` 同時支援 Keycloak（`realm_access.roles`）與 Cognito（`cognito:groups`），平台差異只出現在 Spring profile（`docker`、`k8s`、`mtls`、`aws`）與部署檔。
+
+#### 3.0.2 部署拓樸與驗證狀態
+
+| # | 拓樸 | 啟動方式 | IdP | 入口 | 驗證方式 | 結果 |
+|---|---|---|---|---|---|---|
+| 1 | 本機開發 | `deploy/scripts/start-local.sh`（基礎設施在 Docker、服務用 `bootRun`） | Keycloak | :8081 / :8082 | 無自動化測試 | 未單獨驗證（服務程式與 #2 相同，只是改以 `bootRun` 執行） |
+| 2 | Docker Compose | `start-docker.sh start` | Keycloak | :8081 / :8082 | `integration-test.sh` | ✅ **15 passed / 0 failed** |
+| 3 | Kind（K8s） | `k8s-deploy.sh --build` | Keycloak | NodePort 30081 / 30082 → :8081 / :8082 | `k8s-integration-test.sh` | ✅ **31 passed / 0 failed** |
+| 4 | Kind ＋ cert-manager mTLS | `k8s-mtls-deploy.sh --install-cert-manager --verify` | Keycloak | 叢集內 HTTPS（雙向憑證） | `--verify`：帶 client 憑證 → 握手成功並收到應用程式回應；不帶 → 握手被拒 | ✅ 3 張憑證 `Ready`；帶憑證 → TLS 1.3 握手成功、應用程式回 HTTP 401（未帶 JWT）；不帶憑證 → 握手被拒（000） |
+| 5 | **AWS** | `aws/scripts/deploy-all.sh` | Cognito | API Gateway | `aws/scripts/50-verify.sh` | ✅ **53 passed / 0 failed** |
+
+> #2–#4 的容器需要從 Docker Hub / quay.io 拉 image，因此改在 **AWS CodeBuild（privileged 模式，4 vCPU / 7 GB）** 內執行：`aws/scripts/25-verify-local-envs.sh` 以 `--buildspec-override aws/codebuild/buildspec-local-verify.yml` 啟動，依序跑 Docker Compose → Kind → Kind+mTLS，結束後拆除，不推送任何 image（2026-11-15，build `f8f053fa`，約 10 分鐘）。
+>
+> **涵蓋範圍**：#2–#4 的整合測試檢查容器 / Pod 狀態、ConfigMap / Secret / PVC、健康檢查、未帶 token 時 API 回 401、Keycloak 管理介面、mTLS 握手。`deploy/` 下的 Compose 與 K8s 設定**不會自動匯入 Keycloak realm**（原專案設計；匯入檔在 `infra/keycloak/realm-export.json`），因此**帶 token 的 RBAC / 多租戶情境只在 AWS（#5）與 Cucumber 場景測試中驗證**。
+
+![Docker Compose / Kind / mTLS 驗證通過](docs/images/32-local-envs-docker-kind-mtls-pass.jpg)
+
+#### 3.0.3 開源版拓樸（Docker Compose / Kind）
+
+```mermaid
+flowchart LR
+    CLI["curl / 腳本"] -->|"取得 token"| KC["Keycloak :8180<br/>issuer: realms/ecommerce<br/>（realm 需另行匯入）"]
+    KC -->|"User Federation"| LDAP["OpenLDAP :389"]
+    KC --> PG[("PostgreSQL<br/>Keycloak DB")]
+    CLI -->|"Bearer token"| PS["product-service :8081"]
+    CLI -->|"Bearer token"| US["user-service :8082"]
+    PS -->|"JWKS"| KC
+    US -->|"JWKS"| KC
+    PS --> H2P[("H2 /data/productdb")]
+    US --> H2U[("H2 /data/userdb")]
+    US -.->|"mTLS :8081（僅 #4）<br/>cert-manager 簽發"| PS
+    PS -.->|"健康檢查 :8091（HTTP）"| PROBE["kubelet probe"]
+```
+
+
 
 ### 3.1 整體架構圖
 
@@ -748,7 +904,10 @@ flowchart LR
 | `poc-admin` MFA | 由人手動綁定，**沒有政策強制**；文件寫「建議」 | 由 `rbac-poc-admin-force-mfa` **強制**，文件改為「必須」 |
 | `00-bootstrap-iam.sh` | 只檢查不是 root | 另檢查呼叫者已綁 MFA |
 
-> ⚠️ 這項強化是**在 AWS 驗證與清除完成之後**才加入的，目前只通過 `cfn-lint` 與 shell 語法檢查，**尚未在 AWS 上重新部署驗證**。下次依本教學部署時，請確認 Step 1 輸出的 `AdminMfaEnforcedFor` 為 `poc-admin`，並以 `aws iam list-user-policies --user-name poc-admin` 檢查已掛上 `rbac-poc-admin-force-mfa`。
+> ✅ **已於 2026-11-15 實際部署驗證**：Step 1 輸出 `AdminMfaEnforcedFor = poc-admin`；`list-user-policies` 顯示 `rbac-poc-admin-force-mfa`；以 `simulate-principal-policy` 模擬，`aws:MultiFactorAuthPresent=true` → allowed、`false` → **explicitDeny**；以 MFA 登入的主控台開啟 CloudShell 時 API 呼叫正常。
+>
+> ![bootstrap 輸出 AdminMfaEnforcedFor](docs/images/29-bootstrap-admin-mfa-enforced.jpg)
+> ![MFA 政策模擬](docs/images/30-admin-mfa-simulate.jpg)
 
 #### 4.0.5 帳號生命週期
 
@@ -1028,7 +1187,8 @@ Stack 之間以 **CloudFormation Exports / ImportValue** 串接（例如 `rbac-p
 | `01-preflight.sh` | deployer | 身分、region、bootstrap 輸出、template 驗證 |
 | `10-deploy-foundation.sh` | deployer | network → (data ∥ identity → build) |
 | `20-build-images.sh` | deployer | 打包原始碼 → S3 → CodeBuild（單元測試 + image）→ 取得 image tag |
-| `30-deploy-services.sh` | deployer | ECS + ALB → API Gateway → 等待 service stable |
+| `25-verify-local-envs.sh`（選用） | deployer | 在 CodeBuild 內跑 Docker Compose / Kind / Kind+mTLS 三條非 AWS 部署路徑（`buildspec-local-verify.yml`） |
+| `30-deploy-services.sh` | deployer | ECS + ALB → API Gateway → 等待 service stable → **等待 VPC Link `AVAILABLE`** |
 | `40-seed-users.sh` | deployer | 建立 6 個測試帳號；**隨機密碼只存在 CloudShell `~/.rbac-poc/test-users.env`（600）** |
 | `50-verify.sh` | deployer | 端到端驗證並輸出 Markdown 報告 |
 | `99-cleanup.sh [--all]` | deployer / poc-admin | 反向刪除 stack；`--all` 另刪 artifact bucket 與 IAM bootstrap |
@@ -1179,13 +1339,29 @@ CodeBuild 依序執行：`security-lib` / `tenant-lib` / `product-service` / `us
 
 ![驗證 1–20](docs/images/22-verify-pass-1.jpg)
 ![驗證 21–53](docs/images/23-verify-pass-2.jpg)
+![2026-11-15 重新部署：53/53 且無 CORS](docs/images/31-aws-verify-53-no-cors.jpg)
+
+### Step 7b（選用）：在 CodeBuild 驗證 Docker Compose / Kind / mTLS
+
+不需要本機 Docker，直接借用 40-build 的 CodeBuild 專案（privileged 模式）跑原專案的三條部署路徑：
+
+```bash
+./aws/scripts/25-verify-local-envs.sh
+#   VERIFY SUMMARY A docker-compose PASS 15 checks
+#   VERIFY SUMMARY B kind-k8s PASS 31 checks
+#   VERIFY SUMMARY C kind-mtls PASS
+```
+
+腳本會把目前的工作目錄打包成 `source/rbac-poc-local-verify.zip`，以 `--buildspec-override aws/codebuild/buildspec-local-verify.yml` 啟動 build（上限 90 分鐘，實測約 10 分鐘），不推送 image。
+
+![Docker Compose / Kind / mTLS 驗證通過](docs/images/32-local-envs-docker-kind-mtls-pass.jpg)
 
 
 ---
 
 ## 9. 驗證結果
 
-最終結果：**52 passed, 0 failed, 1 skipped**（2026-11-12 13:00 UTC，`rbac-poc-deployer` 於 CloudShell 執行）。完整報告見 [`docs/verify-report.md`](docs/verify-report.md)。
+最終結果：**53 passed, 0 failed**（2026-11-15 15:54 UTC，移除 Spring Cloud 與 CORS 後第二次完整部署，`rbac-poc-deployer` 於 CloudShell 執行）。第一次部署（2026-11-12）為 52 passed / 1 skipped，差別在第 53 項。完整報告見 [`docs/verify-report.md`](docs/verify-report.md)。
 
 | 區塊 | 驗證內容 | 案例數 | 結果 |
 |---|---|:-:|:-:|
@@ -1196,7 +1372,8 @@ CodeBuild 依序執行：`security-lib` / `tenant-lib` / `product-service` / `us
 | E. 多租戶隔離 | 列表只見本租戶；**他租戶 by-id GET / PUT 回 404**（F1 修正生效）；ADMIN 跨租戶可見；tenant_id 寫入 RDS | 11 | ✅ |
 | F. 稽核 | `audit_logs` 記錄 PRODUCT_CREATED / PRODUCT_DELETED 與 Cognito 使用者名稱；只有 ADMIN / AUDITOR 可查 | 5 | ✅ |
 | G. 安全態勢 | 使用者**無法自行修改 `custom:tenant_id`**；ALB 為 internal；RDS 非公開且加密；Fargate task 無 public IP | 5 | ✅ |
-| G. ECR 掃描 | deployer 當時沒有讀取掃描結果的權限 → SKIP（`00-bootstrap-iam.yaml` 已補上唯讀權限） | 1 | ⏭️ |
+| G. ECR 掃描 | product image 無 CRITICAL 弱點（第一次部署時 deployer 沒有讀取權限而 SKIP，補上唯讀權限後本次 PASS） | 1 | ✅ |
+| ＋ CORS 移除 | `CorsConfiguration` 為空；帶 `Origin: https://evil.example` 的請求，回應沒有 `Access-Control-Allow-Origin` | — | ✅ |
 
 > **驗證的意義**：A 證明未驗證流量根本進不了 VPC；C + E 證明授權在服務內仍然生效（縱深防禦，不只靠 API Gateway）；E-37/38 證明本次修正的跨租戶漏洞在雲端環境確實被堵住；G-48 證明「租戶身分」無法被使用者自行竄改。
 
@@ -1221,6 +1398,11 @@ CodeBuild 依序執行：`security-lib` / `tenant-lib` / `product-service` / `us
 | 10-10 | Step 5 ECS | user-service log：`syntax error at or near "user"`（`alter table if exists user.audit_logs ...`） | schema-per-service 把 user-service 的 schema 取名為 `user`，**`user` 是 PostgreSQL 保留字**，Hibernate 產生的 DDL / SQL 沒有加引號 | schema 改名為 `user_service`。連帶影響：`audit-lib` 的 `AuditHealthIndicator` 查詢 `user.audit_logs` 失敗 → `/actuator/health` 回 DOWN(503) → ALB 判定 unhealthy → Circuit Breaker 回滾 |
 | 10-11 | Step 7 驗證 | 所有 **GET** 回 `400 Bad Request`，回應 header 為 `server: awselb/2.0`；POST/PUT/DELETE 正常 | ALB 設了 `routing.http.desync_mitigation_mode=strictest`：API Gateway 轉送的 GET 被 ALB 歸類為「acceptable」而非「compliant」，strictest 模式只放行 compliant | 改回 AWS 預設 `defensive`（仍會防護 HTTP desync） |
 | 10-12 | Step 7 驗證 | 驗證腳本 curl 出現 `option -X: blank argument` | **腳本 bug**：`local m="$1" ... args=(... -X "$m")` 寫在同一行時，`$m` 在賦值前就被展開 | 拆成兩個 `local` 宣告 |
+| 10-13 | 2026-11-15 重新部署 | CloudShell 分頁全部重新連線，前景執行的 `deploy-all.sh` 中斷（stack 本身已完成） | CloudShell 工作階段重置會結束前景程序 | 長時間步驟改用 `nohup … > log 2>&1 < /dev/null &`；CloudFormation 部署可重入，重跑剩餘腳本即可 |
+| 10-14 | 2026-11-15 Step 7 | `50-verify.sh` 7 項失敗，API Gateway 回 **503** | 60-api stack 完成時 **VPC Link 仍為 `PENDING`**，要再幾分鐘才 `AVAILABLE` | `30-deploy-services.sh` 加入等待 VPC Link `AVAILABLE`；重跑後 53/53 |
+| 10-15 | Step 7b | CodeBuild 在 `DOWNLOAD_SOURCE` 失敗：`Expected Commands[2] to be of string type: found subkeys` | buildspec 指令中出現 `通過: `（冒號＋空白），YAML 把它解析成 mapping | 含冒號的指令改用 `- \|` 區塊字串 |
+| 10-16 | Step 7b mTLS | 帶 client 憑證呼叫 `https://product-service:8081/actuator/health` 回 **401**，原檢查判定失敗 | mtls profile 把健康檢查放在**管理埠 8091（HTTP）**；8081 上的端點需要 JWT。TLS 握手其實成功 | 改為驗證「帶憑證 → 握手成功並收到應用程式 HTTP 回應」＋「不帶憑證 → 握手被拒（000）」 |
+| 10-17 | Step 7b | （預防）Docker Hub 匿名拉取在 CodeBuild 共用 IP 上可能被限流（429） | Docker Hub rate limit | 官方映像（postgres、eclipse-temurin）先嘗試 Docker Hub，失敗改從 **ECR Public**（`public.ecr.aws/docker/library/*`）拉取再 retag |
 
 
 **通用除錯指令**
@@ -1357,7 +1539,7 @@ aws logs describe-log-groups --log-group-name-prefix /rbac-poc --query 'logGroup
 | E | **服務 Token（OAuth2 client credentials）+ 一般 TLS** | 極低（Cognito M2M 依用量計費） | 服務以 Cognito 發的 access token 互相驗證身分；傳輸用一般 TLS | 原 `audit-lib` 已有 `ServiceTokenProvider` / `ServiceAuthInterceptor` | 只做身分驗證，**不是 mTLS**；仍需處理傳輸加密 |
 | F | **VPC Lattice + IAM auth policy** | 依服務小時、流量與請求數計費 | 以 IAM 簽章控制服務間存取，不需管理客戶端憑證 | 不用 PKI 也能做服務級授權 | 是否需要 Private CA、TLS 由誰終結，**本次未從官方文件確認**；導入前請查閱 Lattice 文件 |
 
-> **AWS App Mesh 不建議採用**：依目前所知 App Mesh 已排定於 2026-09-30 終止支援，**撰寫本文時未再次確認其現況**；新專案請改用 Service Connect 或 VPC Lattice。
+> **不要採用 AWS App Mesh**：App Mesh 已於 **2026-09-30 終止支援**（2026-11 依 AWS 官方遷移文章確認），新專案請改用 Service Connect 或 VPC Lattice。
 
 #### 選擇建議
 
@@ -1392,10 +1574,10 @@ rbac-poc-on-aws-tutorial/
 ├── README.md                      ← 本教學
 ├── aws/                           ← ★ AWS 版本新增
 │   ├── cloudformation/            00-bootstrap-iam … 60-api
-│   ├── codebuild/buildspec.yml
+│   ├── codebuild/buildspec.yml    （＋ buildspec-local-verify.yml：在 CodeBuild 驗證 Docker / Kind / mTLS）
 │   ├── docker/Dockerfile.{product,user}-service
 │   ├── lambda/pre-token-generation/index.js
-│   └── scripts/                   env / 00 / 01 / 10 / 20 / 30 / 40 / 50 / 99 / deploy-all
+│   └── scripts/                   env / 00 / 01 / 10 / 20 / 25 / 30 / 40 / 50 / 99 / deploy-all
 ├── docs/
 │   ├── images/                    ← 部署過程截圖
 │   ├── deployment-log.md          ← 實際部署時間軸
